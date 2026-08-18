@@ -62,7 +62,7 @@ it; it is off by default and the host compensates it when on.
 
 ## Measured performance
 
-From the test suite (`./build/tests/fbk_tests`, 54 checks, all passing under
+From the test suite (`./build/tests/fbk_tests`, 412 checks, all passing under
 Linux GCC, Linux Clang, MSVC and Apple Clang):
 
 | Measurement | Result |
@@ -79,6 +79,8 @@ Linux GCC, Linux Clang, MSVC and Apple Clang):
 | CPU, all stages on, 16-sample buffer | **3.1% of one core** per mono channel |
 | 20 s of silence after hostile input | 8.8e−24 |
 | Allocations on the audio thread, 2000 blocks + parameter sweeps | **0** |
+| Room-mode priors: tone energy leaked at onset | **−33%** |
+| Sweep round trip vs known room (delay / RT60 / reflection) | 201 vs 200 samples / 0.394 vs 0.400 s / 0.41 vs 0.50 |
 | pluginval, strictness level 5 (VST3) | passes |
 
 For context, published testing of Alpha Labs De-Feedback reported around 33% of a
@@ -127,14 +129,82 @@ trip, because there is no host buffering in the path at all.
 | **Rumble** | on, 35 Hz | 4th-order high-pass, below every vocal fundamental. |
 
 Start with everything at default and only **Strength** in play. If a specific
-feedback mode is getting through, raise Sensitivity before anything else.
+feedback mode is getting through, raise Sensitivity before anything else — or
+better, calibrate (below), which sets the thresholds from measurement instead.
 
-### The capture button
+## Calibrate tab
 
-Enable **Capture last 12 s**, and when something misbehaves press **Save WAV…**.
-You get a two-channel file: channel 1 is the untouched input, channel 2 is the
-processed output. That recording of your actual room and rig is far more useful
-for tuning the detector than any amount of synthetic test material.
+Every detection threshold shipped as a default was chosen against a *synthetic*
+voice. That is the weakest part of the design, because those thresholds decide
+whether a canceller engages on a vocal harmonic. Calibration replaces the guesses
+with measurements of your voice in your room.
+
+Run each phase once, in order. **Nothing changes until you press Apply.**
+
+| Phase | What you do | What it measures |
+|---|---|---|
+| **1. Room noise** (15 s) | Everyone quiet, PA at show gain | Per-band noise floor; sets the absolute peak gate in real dBFS instead of a guess |
+| **2. Voice** (45 s) | Talk and sing across your range, PA down | Long-term average spectrum, f0 range, and a histogram of what each detection criterion *does* on your voice |
+| **3. Room modes** (90 s) | Push gain past show level, slowly | The frequencies the suppressor actually has to fight |
+
+Phase 2 is the important one. It histograms PNPR, PHPR, peak prominence and
+frequency stability across your voice, then places each threshold just outside
+that distribution — so a feedback tone has to be more tone-like than anything your
+voice has ever produced. During this phase the detector is in observe-only mode
+and **cancels nothing**, so it cannot act on the signal it is characterising.
+
+On the synthetic test voice, the shipped 2.5 Hz frequency-stability threshold
+turned out to be five times looser than necessary; calibration tightens it to
+0.4 Hz, which catches feedback sooner while still rejecting that voice. The
+prominence gate, by contrast, came out at 12.2 dB against a hand-picked default of
+12 dB — so some guesses were fine and some were not, which is rather the point of
+measuring.
+
+**Phase 3 is not ringing out.** Cancellation stays fully **on** while you raise
+the gain — being protected is what makes pushing it safe. The plugin logs every
+mode it had to kill, and those frequencies become *priors*: at a known-suspect
+frequency the detector needs less evidence before it confirms, so it engages
+faster there. Measured effect: **33% less tone energy leaks through at onset**.
+No EQ is applied, nothing is cut, and cancellation still only happens when a tone
+is genuinely present.
+
+Profiles save and load as JSON. Every value in them is in Hz or dB rather than
+bins or samples, so a profile measured at 48 kHz is still valid at 44.1 kHz (the
+plugin says so when the rates differ).
+
+## Diagnostics tab
+
+**Telemetry** logs band energies and every detection — with all six criterion
+values — at 25 Hz to CSV. Roughly 50–70 MB per hour as text, against about 1 GB
+per hour for dry+wet audio, and far more useful: when a tone gets through, the
+question is never "what did it sound like" but "which criterion failed", and only
+one of these two records can answer that. The panel shows actual rows written, so
+you never have to trust my estimate. The audio thread only pushes fixed-size
+frames into a lock-free ring; every file operation happens on a background thread,
+and if that thread ever fell behind, frames are dropped and counted rather than
+stalling the audio.
+
+**Rolling capture** keeps the last 12 seconds and saves it automatically when
+something happens — a new detection, or the difference signal (input minus output)
+exceeding a threshold you set. That second trigger is the one that matters most
+and is hardest to notice by ear: it fires when the plugin is doing something
+substantial, which is exactly the case to review if you suspect it is acting on
+the voice. You get a two-channel file: channel 1 untouched input, channel 2
+processed.
+
+**Feedback path measurement** emits an exponential sine sweep to the PA and
+deconvolves the microphone return into the impulse response of the whole loop —
+console, PA, room, mic. Exported as WAV. This is what makes realistic closed-loop
+feedback simulation possible for v0.2 training, rather than approximating with
+public impulse responses. It reports loop delay, RT60 and peak level, and warns
+you if the take clipped or was too quiet.
+
+Verified against a synthetic room: a 200-sample loop delay came back as 201, an
+RT60 of 0.400 s measured as 0.394 s, and a reflection at half amplitude recovered
+at 0.41.
+
+It emits full-band audio at a level you choose and requires an explicit
+confirmation. Don't do it with an audience in the room.
 
 ---
 
@@ -178,8 +248,9 @@ libxinerama-dev libxcursor-dev libfreetype-dev libfontconfig1-dev libgl1-mesa-de
   protection, and decision-directed SNR smoothing to avoid musical noise), but
   this is the stage a learned separator will improve most.
 - **macOS builds are unsigned.** See above.
-- **Detector thresholds are defaults, not tuned to your room.** Use the capture
-  button.
+- **Detector thresholds are defaults until you calibrate.** The Calibrate tab
+  exists precisely to fix this; until you run it, every threshold is a guess made
+  against a synthetic voice.
 - **44.1 and 48 kHz are the designed-for rates.** Higher rates load and run — the
   band layout is derived per rate and pluginval exercises up to 96 kHz — but the
   analysis window is a fixed 2048 samples, so at 96 kHz it covers half the time

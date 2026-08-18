@@ -10,6 +10,7 @@ add_library(fbk_dsp STATIC
     TonalCanceller.cpp
     MaskFilter.cpp
     Calibration.cpp
+    SweepMeasurement.cpp
     FeedbackSuppressor.cpp
 )
 

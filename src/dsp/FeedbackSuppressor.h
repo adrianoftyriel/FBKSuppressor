@@ -35,6 +35,8 @@
 #include "MaskFilter.h"
 #include "NoiseTracker.h"
 #include "SpectralSeparator.h"
+#include "SweepMeasurement.h"
+#include "Telemetry.h"
 #include "TonalCanceller.h"
 
 namespace fbk
@@ -65,6 +67,11 @@ struct Parameters
 
     bool  highPassEnabled { true };
     float highPassHz { 35.0f };
+
+    bool  telemetryEnabled { false };
+    // How much of the input's energy we have to be removing before the rolling
+    // audio buffer is worth keeping, as dB relative to the input.
+    float eventDifferenceThresholdDb { -15.0f };
 
     // Set when a calibration profile has been applied. Purely informational for
     // the UI; the profile's effects are pushed into the components directly.
@@ -124,6 +131,22 @@ public:
     void clearProfile() noexcept;
     bool hasProfileApplied() const noexcept { return profileApplied_; }
 
+    // --- Feedback-path measurement ----------------------------------------
+    // While a sweep is running the plugin stops processing entirely: it emits the
+    // sweep and records the return, and nothing else. Feeding the detector during a
+    // sweep would be meaningless - the microphone is hearing our own test signal -
+    // so the analysis chain is reset when the sweep ends rather than left holding
+    // nonsense.
+    SweepMeasurement& sweep() noexcept { return sweep_; }
+    bool isSweeping() const noexcept { return sweep_.isRunning(); }
+
+    // --- Telemetry --------------------------------------------------------
+    TelemetryRing& telemetry() noexcept { return telemetry_; }
+    EventTrigger& eventTrigger() noexcept { return eventTrigger_; }
+    // dB of input energy currently being removed. Negative; closer to zero means
+    // the plugin is doing more.
+    float differenceDb() const noexcept { return differenceDb_; }
+
     // v0.2 hook. Ownership stays with the caller; pass nullptr to revert to the
     // heuristic presence estimate.
     void setSeparator (SpectralSeparator* s) noexcept { separator_ = s; }
@@ -164,6 +187,17 @@ private:
     // thread_local static would allocate on first use, and first use is on the
     // audio thread.
     std::vector<float> meterBandNoise_, meterBandPower_;
+
+    SweepMeasurement sweep_;
+    bool sweepWasRunning_ { false };
+
+    TelemetryRing telemetry_;
+    EventTrigger  eventTrigger_;
+    TelemetryFrame telemetryScratch_ {};
+    int  telemetryDecimator_ { 0 };
+    long long sampleClock_ { 0 };
+    float diffPower_ { 0.0f }, inPower_ { 0.0f }, powerCoeff_ { 0.999f };
+    float differenceDb_ { -120.0f };
 
     Calibrator calibrator_;
     bool profileApplied_ { false };

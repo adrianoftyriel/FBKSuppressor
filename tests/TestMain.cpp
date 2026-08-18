@@ -8,6 +8,8 @@
 
 #include "Analyser.h"
 #include "Calibration.h"
+#include "SweepMeasurement.h"
+#include "Telemetry.h"
 #include "ErbBands.h"
 #include "FeedbackSuppressor.h"
 #include "Fft.h"
@@ -1066,6 +1068,344 @@ void testModePriorsSpeedUpEngagement()
 }
 
 // ===========================================================================
+void testTelemetryRing()
+{
+    beginTest ("Telemetry ring: lossless when drained, drops rather than blocks");
+
+    TelemetryRing ring;
+    ring.prepare (16);
+    ring.setEnabled (true);
+
+    TelemetryFrame f {};
+    TelemetryFrame out {};
+
+    // Drained as we go: nothing lost, values intact.
+    for (int i = 0; i < 100; ++i)
+    {
+        f.sampleTime = i;
+        CHECK (ring.push (f));
+        CHECK (ring.pop (out));
+        CHECK (out.sampleTime == i);
+    }
+    CHECK (ring.droppedFrames() == 0);
+    CHECK (! ring.pop (out));
+
+    // Consumer stalls: the producer must drop and count, never block or overwrite
+    // unread data. Dropping diagnostics beats an audio dropout every time.
+    ring.resetDropped();
+    int accepted = 0;
+    for (int i = 0; i < 100; ++i)
+        if (ring.push (f))
+            ++accepted;
+
+    info ("accepted %.0f of 100 with a stalled consumer, ", static_cast<double> (accepted));
+    info ("dropped = %.0f", static_cast<double> (ring.droppedFrames()));
+    CHECK (accepted < 100);
+    CHECK (accepted + ring.droppedFrames() == 100);
+
+    // What was accepted must still be readable and uncorrupted.
+    int recovered = 0;
+    while (ring.pop (out))
+        ++recovered;
+    CHECK (recovered == accepted);
+
+    // Disabled means silent.
+    ring.setEnabled (false);
+    CHECK (! ring.push (f));
+}
+
+// ===========================================================================
+void testTelemetryCapturesDetection()
+{
+    beginTest ("Telemetry records the criteria behind a detection");
+
+    const double sr = 48000.0;
+    FeedbackSuppressor fs;
+    fs.prepare (sr, 256);
+    auto params = defaultParams();
+    params.telemetryEnabled = true;
+    params.humEnabled = false;
+    params.highPassEnabled = false;
+    fs.setParameters (params);
+
+    const double toneHz = 2450.0;
+    const int n = static_cast<int> (sr * 3.0);
+    Rng rng (73);
+    std::vector<float> sig (static_cast<size_t> (n));
+    double phase = 0.0;
+    for (int i = 0; i < n; ++i)
+    {
+        phase += 2.0 * fbk::kPi * toneHz / sr;
+        sig[static_cast<size_t> (i)] =
+            static_cast<float> (0.3 * std::sin (phase)) + 0.002f * rng.gaussian();
+    }
+
+    // Drain as we process, standing in for the consumer thread.
+    int frames = 0, framesWithConfirmed = 0;
+    float bestFreq = 0.0f;
+    bool timeMonotonic = true;
+    long long previousTime = -1;
+
+    TelemetryFrame tf {};
+    int pos = 0;
+    while (pos < n)
+    {
+        const int len = std::min (256, n - pos);
+        fs.processBlock (sig.data() + pos, len);
+        pos += len;
+
+        while (fs.telemetry().pop (tf))
+        {
+            ++frames;
+            if (tf.sampleTime <= previousTime)
+                timeMonotonic = false;
+            previousTime = tf.sampleTime;
+
+            if (tf.confirmedTones > 0)
+            {
+                ++framesWithConfirmed;
+                for (int i = 0; i < tf.numActiveTones; ++i)
+                    if (tf.tones[i].confirmed)
+                        bestFreq = tf.tones[i].freqHz;
+            }
+        }
+    }
+
+    info ("telemetry frames drained = %.0f", static_cast<double> (frames));
+    info ("frames with a confirmed tone = %.0f", static_cast<double> (framesWithConfirmed));
+    info ("recorded tone frequency = %.1f Hz", static_cast<double> (bestFreq));
+
+    // Roughly 25 frames a second over 3 seconds.
+    CHECK_GT (frames, 50);
+    CHECK (timeMonotonic);
+    CHECK (fs.telemetry().droppedFrames() == 0);
+    CHECK_GT (framesWithConfirmed, 5);
+    CHECK_CLOSE (static_cast<double> (bestFreq), toneHz, 30.0);
+
+    // The difference figure must show the plugin doing real work on a signal that
+    // is almost entirely feedback.
+    info ("difference = %.1f dB of input energy removed", static_cast<double> (fs.differenceDb()));
+    CHECK_GT (fs.differenceDb(), -6.0f);
+}
+
+// ===========================================================================
+void testEventTriggerFiresAndHoldsOff()
+{
+    beginTest ("Event trigger fires on detection and then holds off");
+
+    const double sr = 48000.0;
+    FeedbackSuppressor fs;
+    fs.prepare (sr, 256);
+    auto params = defaultParams();
+    params.telemetryEnabled = true;
+    params.humEnabled = false;
+    params.highPassEnabled = false;
+    fs.setParameters (params);
+    fs.captureRing().setEnabled (true);
+
+    const double toneHz = 3300.0;
+    const int n = static_cast<int> (sr * 8.0);
+    Rng rng (91);
+    std::vector<float> sig (static_cast<size_t> (n));
+    double phase = 0.0;
+    for (int i = 0; i < n; ++i)
+    {
+        phase += 2.0 * fbk::kPi * toneHz / sr;
+        sig[static_cast<size_t> (i)] =
+            static_cast<float> (0.3 * std::sin (phase)) + 0.002f * rng.gaussian();
+    }
+
+    int events = 0;
+    int pos = 0;
+    while (pos < n)
+    {
+        const int len = std::min (256, n - pos);
+        fs.processBlock (sig.data() + pos, len);
+        pos += len;
+        if (fs.eventTrigger().consume())
+            ++events;
+    }
+
+    info ("events over 8 s of continuous feedback = %.0f", static_cast<double> (events));
+
+    // At least one, and the 5 s holdoff must stop a single sustained problem from
+    // producing an event every frame.
+    CHECK_GT (events, 0);
+    CHECK_LT (events, 4);
+
+    // And the rolling capture must actually hold audio to go with it.
+    std::vector<float> dry, wet;
+    const int captured = fs.captureRing().snapshot (dry, wet);
+    info ("capture ring holds %.0f samples", static_cast<double> (captured));
+    CHECK_GT (captured, static_cast<int> (sr));
+}
+
+// ===========================================================================
+void testSweepRecoversAKnownRoom()
+{
+    beginTest ("Sweep deconvolution recovers a known impulse response");
+
+    const double sr = 48000.0;
+
+    // A synthetic "room": direct sound at 200 samples, a discrete reflection 500
+    // samples later at half amplitude, and an exponentially decaying diffuse tail
+    // tuned for an RT60 of about 0.4 s. If the deconvolution is right, all three
+    // features come back out.
+    const int irLength = 24000;              // 500 ms
+    const int directDelay = 200;
+    const int reflectionOffset = 500;
+    const double tauAmplitude = 2783.0;      // -> RT60 ~ 0.4 s
+    const double expectedRt60 = 6.9 * tauAmplitude / sr;
+
+    std::vector<float> ir (static_cast<size_t> (irLength), 0.0f);
+    ir[static_cast<size_t> (directDelay)] = 1.0f;
+    ir[static_cast<size_t> (directDelay + reflectionOffset)] = 0.5f;
+
+    Rng rng (137);
+    for (int i = directDelay; i < irLength; ++i)
+    {
+        const double env = std::exp (-static_cast<double> (i - directDelay) / tauAmplitude);
+        ir[static_cast<size_t> (i)] += static_cast<float> (0.12 * env * rng.gaussian());
+    }
+
+    SweepMeasurement sweep;
+    sweep.prepare (sr, 3.0f, 1.5f);
+    sweep.setLevelDb (-26.0f);
+    sweep.start();
+    CHECK (sweep.isRunning());
+
+    // Run the loop one sample at a time: the microphone hears the emitted signal
+    // convolved with the room, so the input at each instant depends only on what
+    // has already been emitted.
+    std::vector<float> emitted (static_cast<size_t> (irLength), 0.0f);
+    int writePos = 0;
+    int guard = 0;
+    const int maxSamples = static_cast<int> (sr * 6.0);
+
+    while (sweep.isRunning() && guard < maxSamples)
+    {
+        // Microphone return from the emitted history.
+        float mic = 0.0f;
+        for (int k = 0; k < irLength; ++k)
+        {
+            int idx = writePos - k;
+            while (idx < 0)
+                idx += irLength;
+            mic += ir[static_cast<size_t> (k)] * emitted[static_cast<size_t> (idx)];
+        }
+
+        float out = 0.0f;
+        sweep.process (&mic, &out, 1);
+
+        writePos = (writePos + 1) % irLength;
+        emitted[static_cast<size_t> (writePos)] = out;
+        ++guard;
+    }
+
+    CHECK (! sweep.isRunning());
+    info ("recorded peak = %.1f dBFS", static_cast<double> (sweep.measuredPeakDbFS()));
+    CHECK (! sweep.clipped());
+    CHECK (! sweep.tooQuiet());
+
+    sweep.computeImpulseResponse();
+    CHECK (sweep.hasResult());
+
+    const auto& recovered = sweep.impulseResponse();
+    CHECK_GT (static_cast<int> (recovered.size()), 4000);
+
+    // The loop delay must come back. One sample of slack for the fact that the
+    // emitted sample is stored after the call.
+    info2 ("measured loop delay %.0f samples, expected %.0f",
+           static_cast<double> (sweep.directDelaySamples()), static_cast<double> (directDelay));
+    CHECK (std::abs (sweep.directDelaySamples() - directDelay) <= 4);
+
+    // Find the direct peak and the reflection within the recovered response.
+    int peakIdx = 0;
+    float peakVal = 0.0f;
+    for (int i = 0; i < static_cast<int> (recovered.size()); ++i)
+        if (std::abs (recovered[static_cast<size_t> (i)]) > peakVal)
+        {
+            peakVal = std::abs (recovered[static_cast<size_t> (i)]);
+            peakIdx = i;
+        }
+
+    CHECK_CLOSE (static_cast<double> (peakVal), 1.0, 0.02);   // normalised to 1
+
+    // The reflection: search a small window around where it should be, because the
+    // diffuse tail is also present there.
+    float reflection = 0.0f;
+    for (int d = -4; d <= 4; ++d)
+    {
+        const int i = peakIdx + reflectionOffset + d;
+        if (i >= 0 && i < static_cast<int> (recovered.size()))
+            reflection = std::max (reflection, std::abs (recovered[static_cast<size_t> (i)]));
+    }
+    info ("recovered reflection amplitude = %.3f (expected ~0.5)", static_cast<double> (reflection));
+    CHECK_CLOSE (static_cast<double> (reflection), 0.5, 0.12);
+
+    info2 ("RT60: measured %.3f s, expected %.3f s",
+           static_cast<double> (sweep.estimatedRt60Seconds()), expectedRt60);
+    CHECK_GT (sweep.estimatedRt60Seconds(), 0.25f);
+    CHECK_LT (sweep.estimatedRt60Seconds(), 0.60f);
+}
+
+// ===========================================================================
+void testSweepTakesOverAndRestores()
+{
+    beginTest ("A running sweep takes over the channel, then normal service resumes");
+
+    const double sr = 48000.0;
+    FeedbackSuppressor fs;
+    fs.prepare (sr, 256);
+    auto params = defaultParams();
+    fs.setParameters (params);
+
+    fs.sweep().prepare (sr, 1.0f, 0.5f);
+    fs.sweep().setLevelDb (-20.0f);
+    fs.sweep().start();
+    CHECK (fs.isSweeping());
+
+    // Feed silence in; the output must be the sweep, not silence.
+    const int n = static_cast<int> (sr * 2.0);
+    std::vector<float> buffer (static_cast<size_t> (n), 0.0f);
+    int pos = 0;
+    while (pos < n)
+    {
+        const int len = std::min (256, n - pos);
+        fs.processBlock (buffer.data() + pos, len);
+        pos += len;
+    }
+
+    CHECK (! fs.isSweeping());
+
+    const double emittedRms = rms (buffer.data(), static_cast<int> (sr));
+    info ("emitted sweep RMS over the first second = %.4f", emittedRms);
+    CHECK_GT (emittedRms, 0.01);
+
+    // After the sweep, normal processing must resume cleanly - and the detector
+    // must not still be chasing the sweep it just heard.
+    fs.reset();
+    SyntheticVoice voice (sr, 140.0);
+    std::vector<float> sig (static_cast<size_t> (static_cast<int> (sr * 3.0)));
+    for (auto& v : sig)
+        v = voice.next();
+
+    const auto out = run (fs, sig, 256);
+
+    bool finite = true;
+    for (float v : out)
+        if (! std::isfinite (v))
+            finite = false;
+    CHECK (finite);
+
+    const int mStart = static_cast<int> (sr * 1.5);
+    const int mLen = static_cast<int> (sr * 1.0);
+    const double db = toDb (rms (out.data() + mStart, mLen)) - toDb (rms (sig.data() + mStart, mLen));
+    info ("voice level after a sweep = %+.2f dB", db);
+    CHECK_LT (std::abs (db), 1.5);
+}
+
+// ===========================================================================
 void testNoAllocationOnAudioThread()
 {
     beginTest ("No allocation in the audio path");
@@ -1247,6 +1587,11 @@ int main()
     testObserveOnlyDoesNotProcess();
     testProfileKeepsVoiceSafeAndTonesCaught();
     testModePriorsSpeedUpEngagement();
+    testTelemetryRing();
+    testTelemetryCapturesDetection();
+    testEventTriggerFiresAndHoldsOff();
+    testSweepRecoversAKnownRoom();
+    testSweepTakesOverAndRestores();
     testNoAllocationOnAudioThread();
     testPhaseModeSwitchIsClean();
     testRealTimeFactor();

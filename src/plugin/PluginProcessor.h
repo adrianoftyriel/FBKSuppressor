@@ -42,7 +42,44 @@ inline constexpr const char* drRt60          = "drRt60";
 
 inline constexpr const char* hpEnabled       = "hpEnabled";
 inline constexpr const char* hpFreq          = "hpFreq";
+
+inline constexpr const char* telemetry       = "telemetry";
+inline constexpr const char* eventThreshold  = "eventThreshold";
 } // namespace fbkparam
+
+// Drains telemetry and writes event captures. Runs off the audio thread entirely:
+// the audio thread only ever pushes POD frames into a lock-free ring, and this
+// thread does every file operation.
+class DiagnosticsWriter final : public juce::Thread
+{
+public:
+    DiagnosticsWriter (class FBKSuppressorProcessor& p);
+    ~DiagnosticsWriter() override;
+
+    void setFolder (const juce::File&);
+    juce::File folder() const;
+
+    void run() override;
+
+    int framesWritten() const noexcept { return framesWritten_.load(); }
+    int eventsWritten() const noexcept { return eventsWritten_.load(); }
+    juce::String lastMessage() const;
+
+private:
+    void openTelemetryFile();
+    void writeFrame (const fbk::TelemetryFrame&);
+    void writeEventCapture();
+
+    class FBKSuppressorProcessor& processor_;
+
+    mutable juce::CriticalSection lock_;
+    juce::File folder_;
+    juce::String lastMessage_;
+
+    std::unique_ptr<juce::FileOutputStream> telemetryStream_;
+    juce::String sessionStamp_;
+    std::atomic<int> framesWritten_ { 0 }, eventsWritten_ { 0 };
+};
 
 class FBKSuppressorProcessor final : public juce::AudioProcessor
 {
@@ -93,6 +130,41 @@ public:
     // Measured cost of the last block as a fraction of real time, smoothed.
     float cpuLoad() const noexcept { return cpuLoad_.load(); }
 
+    // --- Calibration, telemetry, sweep (message thread) --------------------
+    void beginCalibration (fbk::CalibrationPhase);
+    void finishCalibration();
+    void cancelCalibration();
+    fbk::CalibrationPhase calibrationPhase() const;
+    float calibrationProgress() const;
+    float calibrationElapsed() const;
+    const fbk::VoiceProfile& workingProfile() const;
+
+    void applyWorkingProfile();
+    void clearAppliedProfile();
+    bool isProfileApplied() const;
+
+    bool saveProfile (const juce::File&, juce::String& errorOut);
+    bool loadProfile (const juce::File&, juce::String& errorOut);
+
+    void setDiagnosticsFolder (const juce::File& f) { diagnostics_.setFolder (f); }
+    juce::File diagnosticsFolder() const { return diagnostics_.folder(); }
+    DiagnosticsWriter& diagnostics() noexcept { return diagnostics_; }
+
+    void startSweep (float levelDb);
+    void abortSweep();
+    bool isSweeping() const;
+    float sweepProgress() const;
+    // Deconvolves and writes the impulse response. Message thread only.
+    bool exportImpulseResponse (const juce::File&, juce::String& errorOut);
+    juce::String sweepSummary() const;
+
+    // Channel 0's suppressor, for the editor and the diagnostics writer. Null
+    // until prepareToPlay has run.
+    fbk::FeedbackSuppressor* primaryChannel() noexcept
+    {
+        return channels_.empty() ? nullptr : channels_.front().get();
+    }
+
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
     void pullParameters();
@@ -109,6 +181,14 @@ private:
 
     std::atomic<bool> captureEnabled_ { false };
     std::atomic<float> cpuLoad_ { 0.0f };
+
+    // Held here rather than in the DSP so it survives prepareToPlay reallocating
+    // the per-channel suppressors, and so a profile can be loaded before audio
+    // ever starts.
+    fbk::VoiceProfile workingProfile_ {};
+    bool profileAppliedFlag_ { false };
+
+    DiagnosticsWriter diagnostics_ { *this };
 
     // Cached atomic parameter pointers, so processBlock never does a string
     // lookup or touches the parameter tree's locks.
@@ -132,6 +212,8 @@ private:
         std::atomic<float>* drRt60 {};
         std::atomic<float>* hpEnabled {};
         std::atomic<float>* hpFreq {};
+        std::atomic<float>* telemetry {};
+        std::atomic<float>* eventThreshold {};
     } raw_;
 
     fbk::Parameters cachedParams_ {};

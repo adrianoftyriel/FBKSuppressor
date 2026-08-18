@@ -21,6 +21,13 @@ void FeedbackSuppressor::prepare (double sampleRate, int maxBlockSize)
     dryDelay_.prepare (kLookaheadSamples + 8);
     capture_.prepare (sampleRate_, 12.0f);
 
+    // Four seconds of headroom in the ring at 25 Hz, so a consumer that only
+    // wakes a couple of times a second never causes a drop.
+    sweep_.prepare (sampleRate_);
+    telemetry_.prepare (100);
+    eventTrigger_.prepare (sampleRate_);
+    powerCoeff_ = static_cast<float> (std::exp (-1.0 / (0.100 * sampleRate_)));
+
     bandEnergy_.assign (kNumBands, 0.0f);
     separatorPresence_.assign (kNumBands, 0.0f);
     meterBandNoise_.assign (kNumBands, 0.0f);
@@ -45,6 +52,11 @@ void FeedbackSuppressor::reset() noexcept
     dryDelay_.clear();
     metering_ = Metering {};
     meterFrameCounter_ = 0;
+    eventTrigger_.reset();
+    telemetryDecimator_ = 0;
+    sampleClock_ = 0;
+    diffPower_ = inPower_ = 0.0f;
+    differenceDb_ = -120.0f;
 }
 
 void FeedbackSuppressor::applyPhaseMode() noexcept
@@ -67,6 +79,8 @@ void FeedbackSuppressor::setParameters (const Parameters& p) noexcept
     applyPhaseMode();
 
     detector_.setSensitivity (params_.feedbackSensitivity);
+    telemetry_.setEnabled (params_.telemetryEnabled);
+    eventTrigger_.setDifferenceThresholdDb (params_.eventDifferenceThresholdDb);
 
     hum_.setEnabled (params_.humEnabled);
     hum_.setNumHarmonics (params_.humHarmonics);
@@ -229,10 +243,93 @@ void FeedbackSuppressor::onAnalysisFrame() noexcept
         metering_.humActive         = hum_.isActive();
         metering_.meanAttenuationDb = mask_.meanAttenuationDb();
     }
+
+    // --- Event trigger and telemetry ---------------------------------------
+    const TrackedTone* allTones = detector_.tones();
+    int confirmedCount = 0;
+    float firstConfirmedHz = 0.0f;
+    for (int i = 0; i < detector_.numTones(); ++i)
+    {
+        if (allTones[i].active && allTones[i].confirmed)
+        {
+            ++confirmedCount;
+            if (firstConfirmedHz <= 0.0f)
+                firstConfirmedHz = allTones[i].freqHz;
+        }
+    }
+    eventTrigger_.update (confirmedCount, firstConfirmedHz, differenceDb_);
+
+    // ~25 Hz: fast enough to see a detection develop, slow enough to be free.
+    if (telemetry_.isEnabled() && ++telemetryDecimator_ >= 15)
+    {
+        telemetryDecimator_ = 0;
+
+        auto& f = telemetryScratch_;
+        f.sampleTime = sampleClock_;
+        for (int b = 0; b < kNumBands; ++b)
+        {
+            f.bandInputDb[b] = metering_.bandInputDb[b];
+            f.bandNoiseDb[b] = metering_.bandNoiseDb[b];
+            f.bandGainDb[b]  = metering_.bandGainDb[b];
+        }
+        f.speechPresence = noise_.overallSpeechPresence();
+        f.inputPeak = metering_.inputPeak;
+        f.outputPeak = metering_.outputPeak;
+        f.differenceDb = differenceDb_;
+        f.humFundamentalHz = hum_.detectedFundamental();
+        f.humActive = hum_.isActive();
+        f.confirmedTones = confirmedCount;
+
+        int active = 0;
+        for (int i = 0; i < detector_.numTones(); ++i)
+        {
+            const auto& t = allTones[i];
+            if (! t.active)
+                continue;
+            auto& dst = f.tones[active++];
+            dst.freqHz = t.freqHz;
+            dst.confidence = t.confidence;
+            dst.paprDb = t.paprDb;
+            dst.pnprDb = t.pnprDb;
+            dst.phprDb = t.phprDb;
+            dst.prominenceDb = t.localProminenceDb;
+            dst.imsd = t.slopeDeviation;
+            dst.fsdHz = t.freqDeviation;
+            dst.persistence = t.persistence;
+            dst.confirmed = t.confirmed;
+        }
+        f.numActiveTones = active;
+
+        telemetry_.push (f);
+    }
 }
 
 void FeedbackSuppressor::processBlock (float* data, int numSamples) noexcept
 {
+    // A running sweep takes over the channel completely.
+    if (sweep_.isRunning())
+    {
+        sweepWasRunning_ = true;
+        sweep_.process (data, data, numSamples);
+        sampleClock_ += numSamples;
+        return;
+    }
+
+    if (sweepWasRunning_)
+    {
+        // The detector and cancellers spent the last few seconds looking at our own
+        // sweep. Clear that out rather than carrying it into normal operation.
+        sweepWasRunning_ = false;
+        analyser_.reset();
+        noise_.reset();
+        detector_.reset();
+        tonal_.reset();
+        hum_.reset();
+        mask_.reset();
+        highPass_.reset();
+        detector_.setSensitivity (params_.feedbackSensitivity);
+    }
+
     if (params_.bypass)
     {
         // Still run the analyser so that detection state stays current and
@@ -249,6 +346,13 @@ void FeedbackSuppressor::processBlock (float* data, int numSamples) noexcept
             if (latencySamples_ > 0)
                 data[n] = dryDelay_.process (x, latencySamples_);
         }
+
+        // Keep the clock and the difference figure honest while bypassed, so
+        // telemetry timestamps stay continuous across a bypass and the difference
+        // reads as zero rather than as a stale value from before.
+        sampleClock_ += numSamples;
+        diffPower_ = 0.0f;
+        differenceDb_ = -120.0f;
         return;
     }
 
@@ -301,10 +405,20 @@ void FeedbackSuppressor::processBlock (float* data, int numSamples) noexcept
         inPeak  = std::max (inPeak * 0.99999f, std::abs (input));
         outPeak = std::max (outPeak * 0.99999f, std::abs (out));
 
+        // The difference signal is exactly what the plugin is doing to the audio.
+        // Tracking it as a fraction of the input's energy makes it a single honest
+        // number for "how much am I changing this", which is the thing worth
+        // watching on a voice.
+        const float diff = dry - out;
+        diffPower_ = powerCoeff_ * diffPower_ + (1.0f - powerCoeff_) * diff * diff;
+        inPower_   = powerCoeff_ * inPower_   + (1.0f - powerCoeff_) * input * input;
+
         capture_.push (input, out);
     }
 
     metering_.inputPeak = inPeak;
     metering_.outputPeak = outPeak;
+    differenceDb_ = 10.0f * std::log10 ((diffPower_ + kEpsilon) / (inPower_ + kEpsilon));
+    sampleClock_ += numSamples;
 }
 } // namespace fbk

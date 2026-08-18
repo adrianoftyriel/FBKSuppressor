@@ -308,7 +308,102 @@ mean 0.46 dB across 100 Hz–6 kHz.
 
 This is still the weakest stage, and it is what v0.2 targets.
 
-## 11. v0.2: the learned separator
+## 11. Calibration: measuring instead of guessing
+
+Every threshold in section 5 was picked against a synthetic voice. That is a real
+weakness, because those thresholds are what stand between a canceller and
+someone's vocal harmonic.
+
+The fix is not better guesses. It is to run the detector's own criteria over a
+recording of the actual voice, histogram what each one produces, and place each
+threshold just outside that distribution. A feedback tone then has to be more
+tone-like than anything that voice has ever produced.
+
+Two things emerged from implementing it that were not obvious beforehand.
+
+**The prominence gate is the criterion that matters most.** A calibration pass
+initially collected *zero* samples, because the local-prominence gate rejects vocal
+harmonics before any other criterion is evaluated: at f0 = 130 Hz the harmonics sit
+5.5 bins apart, and none of them clears 12 dB over its own neighbourhood. Correct
+at runtime, useless for measuring. Observe mode now widens the aperture to 3 dB so
+the criteria are computed, through the same code path, for the wider population of
+peaks a voice really produces.
+
+That also reframed the risk. A low male voice barely produces isolated peaks at
+all, so the gate alone protects it. A soprano's harmonics are hundreds of hertz
+apart, so every one of them clears the gate and the remaining criteria have to do
+the work — which makes a high, sustained, steady voice the genuine worst case for
+false positives, not a loud one. The gate is therefore calibrated too.
+
+**Some defaults were fine and some were badly wrong.** Measured on the synthetic
+voice: prominence p95 came out at 9.2 dB against a hand-picked gate of 12 dB, so
+that guess was reasonable. But the frequency-stability p05 was 0.50 Hz against a
+default threshold of 2.5 Hz — five times looser than it needed to be. Calibration
+tightens it to 0.4 Hz, which catches feedback sooner at no cost in false positives.
+There is no way to have known that without measuring.
+
+Room-mode profiling is the legitimate form of the technique the brief rules out.
+Ringing out is objectionable because it applies notches pre-emptively; knowing
+which frequencies a room rings at is merely information. So profiling runs with
+cancellation fully **on** while the gain is pushed past show level - being
+protected is what makes that safe - and logs what the suppressor had to fight.
+Those frequencies become priors that lower the evidence needed for confirmation,
+measured at 33% less tone energy leaking through at onset. Nothing is ever
+attenuated pre-emptively.
+
+Everything is explicit-apply. Measuring changes nothing; a completed profile has
+to be applied deliberately, and reverting restores the built-in defaults. An
+adaptive scheme that re-tuned itself during a show would drift toward
+over-suppression silently and leave nothing to roll back to.
+
+## 12. Telemetry, and why not audio
+
+Logging dry and wet audio continuously costs about 1 GB per hour. Logging the
+detector's state costs 50-70 MB per hour as CSV - and answers a different, better
+question. When a tone gets through, nobody needs to know what it sounded like;
+they need to know which criterion failed. Only the telemetry can say.
+
+So: cheap telemetry always, expensive audio only around events. The audio thread
+pushes fixed-size POD frames into a lock-free single-producer ring at 25 Hz and
+never touches a file; a background thread drains it. If that thread ever fell
+behind, the producer drops frames and counts them rather than blocking - dropping
+diagnostics is always better than a dropout, and the count is displayed so a drop
+is never silent.
+
+The second event trigger is the interesting one. A new detection is the obvious
+cue, but the difference signal - input minus output - is the one worth watching,
+because it is by definition "the plugin just did something substantial". That
+catches the failure mode that matters most and is hardest to hear: the processor
+acting when it should not have.
+
+## 13. Measuring the feedback path
+
+An insert on a vocal channel is already wired across the exact loop worth
+measuring: its output feeds the PA, its input is the microphone. So emitting an
+exponential sweep downstream and recording the return gives the impulse response
+of console, PA, room and mic together - which is what makes closed-loop feedback
+simulation realistic for v0.2 training, rather than approximated from public
+impulse responses.
+
+An exponential sweep rather than noise or an impulse because its harmonic
+distortion products fold into *negative* time on deconvolution, so loudspeaker
+nonlinearity lands outside the causal answer instead of smearing through it. For
+measuring a PA at gig level, where the drivers are certainly not linear, that
+property matters more than anything else on offer.
+
+One implementation note worth recording, because it was a quiet error rather than
+an obvious one. Farina's inverse filter is the time-reversed sweep with an
+amplitude envelope that attenuates the *low*-frequency end, compensating the
+sweep's 1/f energy density. I initially applied the envelope as a function of
+position in the original sweep rather than in the reversed filter, which inverts
+it - boosting the low end by about 61 dB over a 20 Hz to 22.8 kHz sweep. The
+result still looked like a plausible impulse response. It was simply wrong: a
+200-sample loop delay came back as 1106, and a reflection at half amplitude came
+back at 0.16. With the envelope the right way round: 201 samples and 0.41, with
+RT60 measured at 0.394 s against 0.400 s expected. A round-trip test against a
+known synthetic room is the only thing that would have caught it.
+
+## 14. v0.2: the learned separator
 
 `SpectralSeparator` is already in the tree with a null implementation. The
 intended model is small, RTNeural-based, and takes the 32 ERB band energies the
@@ -333,7 +428,7 @@ Training needs the DNS-Challenge corpus (~1 TB unpacked: 827 GB clean speech,
 58 GB noise, 5.9 GB impulse responses, plus 60k RIRs from SLR28) with closed-loop
 feedback simulation, and GPU hours. Both are out of scope for the v0.1 build.
 
-## 12. v0.3: sidechain AFC
+## 15. v0.3: sidechain AFC
 
 With the loudspeaker signal available as a reference, the feedback path itself can
 be estimated and subtracted, which removes *zero* voice energy rather than very
