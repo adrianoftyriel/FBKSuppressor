@@ -62,7 +62,8 @@ it; it is off by default and the host compensates it when on.
 
 ## Measured performance
 
-From the test suite (`./build/tests/fbk_tests`, 50 checks, all passing):
+From the test suite (`./build/tests/fbk_tests`, 54 checks, all passing under both
+GCC and Clang):
 
 | Measurement | Result |
 |---|---|
@@ -77,6 +78,7 @@ From the test suite (`./build/tests/fbk_tests`, 50 checks, all passing):
 | Mains hum, 50 / 60 Hz auto-selected | −85.2 / −81.9 dB |
 | CPU, all stages on, 16-sample buffer | **4.4% of one core** per mono channel |
 | 20 s of silence after hostile input | 8.8e−24 |
+| Allocations on the audio thread, 2000 blocks + parameter sweeps | **0** |
 | pluginval, strictness level 5 (VST3) | passes |
 
 For context, published testing of Alpha Labs De-Feedback reported around 33% of a

@@ -1,6 +1,5 @@
 #include "Analyser.h"
 
-#include <numbers>
 
 namespace fbk
 {
@@ -21,13 +20,13 @@ void Analyser::prepare (double sampleRate)
     {
         const double t = static_cast<double> (n) / static_cast<double> (rise);
         window_[static_cast<size_t> (n)] =
-            static_cast<float> (0.5 - 0.5 * std::cos (std::numbers::pi * t));
+            static_cast<float> (0.5 - 0.5 * std::cos (kPi * t));
     }
     for (int n = 0; n < fall; ++n)
     {
         const double t = static_cast<double> (n) / static_cast<double> (fall);
         window_[static_cast<size_t> (rise + n)] =
-            static_cast<float> (0.5 + 0.5 * std::cos (std::numbers::pi * t));
+            static_cast<float> (0.5 + 0.5 * std::cos (kPi * t));
     }
 
     // Centre of mass of the window, measured backwards from the newest sample.

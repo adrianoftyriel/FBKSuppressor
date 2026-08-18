@@ -47,6 +47,15 @@ constexpr int kMaxHumHarmonics = 12;
 
 constexpr float kEpsilon = 1.0e-20f;
 
+// Our own pi rather than std::numbers::pi from <numbers>. That header is C++20
+// and GCC has it, but Apple Clang's libc++ on the macOS CI runner does not - the
+// build failed there while passing on Linux. Since the whole point of keeping the
+// DSP free of dependencies is portability, a constant costs nothing and removes
+// the landmine. (This is also why the CI runs the tests natively on all three
+// platforms rather than trusting Linux to speak for the others.)
+constexpr double kPi  = 3.14159265358979323846;
+constexpr float  kPiF = 3.14159265358979323846f;
+
 // ---------------------------------------------------------------------------
 inline float dbToGain (float db) noexcept { return std::pow (10.0f, 0.05f * db); }
 inline float gainToDb (float g)  noexcept { return 20.0f * std::log10 (std::max (g, 1.0e-12f)); }

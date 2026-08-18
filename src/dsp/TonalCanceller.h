@@ -182,7 +182,7 @@ public:
     {
         sampleRate_ = sampleRate;
         freqHz_ = freqHz;
-        const double w = 2.0 * std::numbers::pi * static_cast<double> (freqHz) / sampleRate;
+        const double w = 2.0 * kPi * static_cast<double> (freqHz) / sampleRate;
         rotR_ = static_cast<float> (std::cos (w));
         rotI_ = static_cast<float> (std::sin (w));
         coeff_ = static_cast<float> (std::exp (-1.0 / (static_cast<double> (timeConstantSeconds) * sampleRate)));

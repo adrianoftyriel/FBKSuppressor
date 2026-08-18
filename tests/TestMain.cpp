@@ -13,8 +13,65 @@
 #include "MaskFilter.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <memory>
+#include <new>
+
+// ---------------------------------------------------------------------------
+// Allocation tracking, so real-time safety is verified rather than asserted.
+//
+// The audio thread must never allocate: an allocation can take a lock, and a
+// lock on the audio thread is a dropout. Reading the code is not enough to be
+// sure - a std::vector::assign hidden three calls down inside a parameter setter
+// is exactly the kind of thing that gets missed, and did get missed here until
+// this test existed. So we replace global operator new and count.
+namespace rtcheck
+{
+std::atomic<bool> armed { false };
+std::atomic<int>  count { 0 };
+
+inline void arm()    { count.store (0); armed.store (true); }
+inline int  disarm() { armed.store (false); return count.load(); }
+} // namespace rtcheck
+
+static void noteAllocation() noexcept
+{
+    if (rtcheck::armed.load (std::memory_order_relaxed))
+        rtcheck::count.fetch_add (1, std::memory_order_relaxed);
+}
+
+void* operator new (std::size_t n)
+{
+    noteAllocation();
+    if (void* p = std::malloc (n ? n : 1))
+        return p;
+    throw std::bad_alloc();
+}
+
+void* operator new[] (std::size_t n) { return ::operator new (n); }
+
+void* operator new (std::size_t n, std::align_val_t a)
+{
+    noteAllocation();
+    const std::size_t align = static_cast<std::size_t> (a);
+    const std::size_t size = ((n + align - 1) / align) * align;
+    if (void* p = std::aligned_alloc (align, size ? size : align))
+        return p;
+    throw std::bad_alloc();
+}
+
+void* operator new[] (std::size_t n, std::align_val_t a) { return ::operator new (n, a); }
+
+void operator delete (void* p) noexcept { std::free (p); }
+void operator delete[] (void* p) noexcept { std::free (p); }
+void operator delete (void* p, std::size_t) noexcept { std::free (p); }
+void operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
+void operator delete (void* p, std::align_val_t) noexcept { std::free (p); }
+void operator delete[] (void* p, std::align_val_t) noexcept { std::free (p); }
+void operator delete (void* p, std::size_t, std::align_val_t) noexcept { std::free (p); }
+void operator delete[] (void* p, std::size_t, std::align_val_t) noexcept { std::free (p); }
 
 using namespace fbk;
 using namespace test;
@@ -77,7 +134,7 @@ void testFft()
     // A pure bin should land in exactly that bin.
     const int bin = 37;
     for (int i = 0; i < n; ++i)
-        in[static_cast<size_t> (i)] = std::cos (2.0 * std::numbers::pi * bin * i / n);
+        in[static_cast<size_t> (i)] = std::cos (2.0 * fbk::kPi * bin * i / n);
     fft.forwardReal (in.data(), spec.data());
 
     int peak = 0;
@@ -322,7 +379,7 @@ void testFeedbackSuppression()
         double phase = 0.0;
         for (int i = 0; i < n; ++i)
         {
-            phase += 2.0 * std::numbers::pi * toneHz / sr;
+            phase += 2.0 * fbk::kPi * toneHz / sr;
             // Feedback builds up over the first second, then sustains.
             const double t = static_cast<double> (i) / sr;
             const double ramp = std::min (1.0, t / 1.0);
@@ -474,7 +531,7 @@ void testVoiceWithFeedback()
         const float v = voice.next();
         voiceOnly[static_cast<size_t> (i)] = v;
 
-        phase += 2.0 * std::numbers::pi * toneHz / sr;
+        phase += 2.0 * fbk::kPi * toneHz / sr;
         // Feedback starts at t = 1 s and rings up.
         const double ramp = clampf (static_cast<float> ((t - 1.0) / 1.5), 0.0f, 1.0f);
         sig[static_cast<size_t> (i)] =
@@ -527,7 +584,7 @@ void testHumCancellation()
             const double t = static_cast<double> (i) / sr;
             double h = 0.0;
             for (int m = 1; m <= 6; ++m)
-                h += (0.08 / m) * std::sin (2.0 * std::numbers::pi * fundamental * m * t);
+                h += (0.08 / m) * std::sin (2.0 * fbk::kPi * fundamental * m * t);
             sig[static_cast<size_t> (i)] = static_cast<float> (h) + 0.001f * rng.gaussian();
         }
 
@@ -688,6 +745,115 @@ void testSustainedNoteNotTreatedAsFeedback()
     CHECK_LT (std::abs (db), 1.5);
 }
 // ===========================================================================
+void testNoAllocationOnAudioThread()
+{
+    beginTest ("No allocation in the audio path");
+
+    const double sr = 48000.0;
+    FeedbackSuppressor fs;
+    fs.prepare (sr, 128);
+
+    auto p = defaultParams();
+    p.dereverbEnabled = true;
+    fs.setParameters (p);
+    fs.captureRing().setEnabled (true);
+
+    SyntheticVoice voice (sr, 145.0);
+    Rng rng (13);
+    std::vector<float> block (128);
+
+    // Warm up outside the armed window: the first frames touch every code path
+    // once, and anything that legitimately allocates once at start-up should be
+    // in prepare(), not counted here.
+    for (int i = 0; i < 200; ++i)
+    {
+        for (auto& v : block)
+            v = voice.next() + 0.002f * rng.gaussian();
+        fs.processBlock (block.data(), static_cast<int> (block.size()));
+    }
+
+    rtcheck::arm();
+
+    for (int i = 0; i < 2000; ++i)
+    {
+        for (auto& v : block)
+            v = voice.next() + 0.002f * rng.gaussian();
+
+        // Sweep parameters while processing, because parameter changes are
+        // applied from inside processBlock and are the likeliest place for a
+        // hidden allocation to be sitting.
+        p.feedbackSensitivity = 0.2f + 0.6f * static_cast<float> (i % 50) / 50.0f;
+        p.denoiseAmount = 0.3f + 0.5f * static_cast<float> (i % 30) / 30.0f;
+        p.humHarmonics = 4 + (i % 8);
+        p.maxAttenuationDb = 6.0f + static_cast<float> (i % 12);
+
+        // And toggle the phase mode, which changes the filter length. This is
+        // the case that was allocating: switching modes used to resize four
+        // coefficient vectors, on the audio thread, on every press.
+        p.qualityMode = ((i / 100) % 2) == 1;
+
+        fs.setParameters (p);
+        fs.processBlock (block.data(), static_cast<int> (block.size()));
+    }
+
+    const int allocations = rtcheck::disarm();
+    info ("allocations during 2000 blocks with parameter sweeps = %.0f",
+          static_cast<double> (allocations));
+    CHECK (allocations == 0);
+}
+
+// ===========================================================================
+void testPhaseModeSwitchIsClean()
+{
+    beginTest ("Switching phase mode mid-stream stays well behaved");
+
+    const double sr = 48000.0;
+    FeedbackSuppressor fs;
+    fs.prepare (sr, 256);
+    auto p = defaultParams();
+    fs.setParameters (p);
+
+    SyntheticVoice voice (sr, 135.0);
+    const int n = static_cast<int> (sr * 4.0);
+    std::vector<float> sig (static_cast<size_t> (n));
+    for (int i = 0; i < n; ++i)
+        sig[static_cast<size_t> (i)] = voice.next();
+
+    std::vector<float> out = sig;
+    int pos = 0;
+    int toggles = 0;
+    while (pos < n)
+    {
+        const int len = std::min (256, n - pos);
+
+        // Flip modes twice a second, in the middle of continuous audio.
+        if ((pos / 24000) % 2 == 1 && ! p.qualityMode) { p.qualityMode = true;  ++toggles; fs.setParameters (p); }
+        if ((pos / 24000) % 2 == 0 && p.qualityMode)   { p.qualityMode = false; ++toggles; fs.setParameters (p); }
+
+        fs.processBlock (out.data() + pos, len);
+        pos += len;
+    }
+
+    CHECK_GT (toggles, 2);
+
+    bool finite = true;
+    double peak = 0.0;
+    for (float v : out)
+    {
+        if (! std::isfinite (v))
+            finite = false;
+        peak = std::max (peak, std::abs (static_cast<double> (v)));
+    }
+    CHECK (finite);
+
+    // The output must not blow up. A discontinuity at the switch is expected and
+    // unavoidable - the filter length changes - but it must stay bounded.
+    const double inPeak = *std::max_element (sig.begin(), sig.end());
+    info2 ("input peak %.3f, output peak %.3f", inPeak, peak);
+    CHECK_LT (peak, inPeak * 4.0 + 0.1);
+}
+
+// ===========================================================================
 void testRealTimeFactor()
 {
     beginTest ("CPU cost / real-time factor");
@@ -713,7 +879,7 @@ void testRealTimeFactor()
         double phase = 0.0;
         for (int i = 0; i < n; ++i)
         {
-            phase += 2.0 * std::numbers::pi * 2500.0 / sr;
+            phase += 2.0 * fbk::kPi * 2500.0 / sr;
             sig[static_cast<size_t> (i)] = voice.next()
                                          + static_cast<float> (0.1 * std::sin (phase))
                                          + 0.002f * rng.gaussian();
@@ -755,6 +921,8 @@ int main()
     testNumericalRobustness();
     testBlockSizeInvariance();
     testSustainedNoteNotTreatedAsFeedback();
+    testNoAllocationOnAudioThread();
+    testPhaseModeSwitchIsClean();
     testRealTimeFactor();
 
     return test::summary();

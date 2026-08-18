@@ -138,6 +138,10 @@ private:
 
     SpectralSeparator* separator_ { nullptr };
     std::vector<float> bandEnergy_, separatorPresence_;
+    // Metering scratch. Members rather than function-local statics: a
+    // thread_local static would allocate on first use, and first use is on the
+    // audio thread.
+    std::vector<float> meterBandNoise_, meterBandPower_;
 
     Metering metering_ {};
     int meterFrameCounter_ { 0 };

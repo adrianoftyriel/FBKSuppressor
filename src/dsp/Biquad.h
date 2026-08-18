@@ -10,7 +10,6 @@
 
 #include "Common.h"
 
-#include <numbers>
 
 namespace fbk
 {
@@ -62,7 +61,7 @@ public:
 
         // Butterworth Q values for a 4th-order cascade.
         static constexpr float qs[2] = { 0.54119610f, 1.30656296f };
-        const double w0 = 2.0 * std::numbers::pi * static_cast<double> (cutoffHz_) / sampleRate_;
+        const double w0 = 2.0 * kPi * static_cast<double> (cutoffHz_) / sampleRate_;
         const double cosw = std::cos (w0);
         const double sinw = std::sin (w0);
 

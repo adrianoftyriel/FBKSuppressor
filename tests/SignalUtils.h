@@ -1,9 +1,10 @@
 // Signal generation and measurement helpers for the DSP tests.
 #pragma once
 
+#include "Common.h"
+
 #include <cmath>
 #include <cstdint>
-#include <numbers>
 #include <vector>
 
 namespace test
@@ -37,7 +38,7 @@ private:
 // than bin-quantised, which matters when measuring 40 dB of cancellation.
 inline double goertzelMagnitude (const float* x, int n, double freqHz, double sampleRate)
 {
-    const double w = 2.0 * std::numbers::pi * freqHz / sampleRate;
+    const double w = 2.0 * fbk::kPi * freqHz / sampleRate;
     const double coeff = 2.0 * std::cos (w);
     double s1 = 0.0, s2 = 0.0;
     for (int i = 0; i < n; ++i)
@@ -78,9 +79,9 @@ public:
     float next() noexcept
     {
         // 5 Hz vibrato, +/- 3% - typical for a sung or projected speaking voice.
-        const double vib = 1.0 + 0.03 * std::sin (2.0 * std::numbers::pi * 5.0 * t_);
+        const double vib = 1.0 + 0.03 * std::sin (2.0 * fbk::kPi * 5.0 * t_);
         // Slow pitch contour so the harmonics never sit still.
-        const double contour = 1.0 + 0.12 * std::sin (2.0 * std::numbers::pi * 0.7 * t_);
+        const double contour = 1.0 + 0.12 * std::sin (2.0 * fbk::kPi * 0.7 * t_);
         const double f0 = f0_ * vib * contour;
 
         float out = 0.0f;
@@ -95,16 +96,16 @@ public:
             const double e2 = 0.7 * std::exp (-std::pow ((fh - 1800.0) / 700.0, 2.0));
             const double amp = (0.25 + e1 + e2) / static_cast<double> (h + 1);
 
-            phases_[static_cast<size_t> (h)] += 2.0 * std::numbers::pi * fh / sampleRate_;
-            if (phases_[static_cast<size_t> (h)] > 2.0 * std::numbers::pi)
-                phases_[static_cast<size_t> (h)] -= 2.0 * std::numbers::pi;
+            phases_[static_cast<size_t> (h)] += 2.0 * fbk::kPi * fh / sampleRate_;
+            if (phases_[static_cast<size_t> (h)] > 2.0 * fbk::kPi)
+                phases_[static_cast<size_t> (h)] -= 2.0 * fbk::kPi;
 
             out += static_cast<float> (amp * std::sin (phases_[static_cast<size_t> (h)]));
         }
 
         // Amplitude envelope with syllabic gaps, so a noise estimator has
         // somewhere to find the floor.
-        const double env = 0.55 + 0.45 * std::sin (2.0 * std::numbers::pi * 2.5 * t_);
+        const double env = 0.55 + 0.45 * std::sin (2.0 * fbk::kPi * 2.5 * t_);
         t_ += 1.0 / sampleRate_;
 
         return static_cast<float> (out * env * 0.12);

@@ -159,7 +159,7 @@ Because the canceller's adaptation rate scales with detection confidence, even a
 false positive that did slip through could only act slowly and narrowly before
 the detector dropped it.
 
-## 6. Four bugs the tests found
+## 6. Six bugs the tests found
 
 Worth recording, because each was a design error rather than a typo, and none
 would have been obvious by reading the code.
@@ -189,6 +189,29 @@ sustained howl as noise and hand a whole ERB band to the mask. That is another
 reason the subtractive stages run first.
 
 **Published detection criteria confirmed vocal harmonics.** Covered above.
+
+**Toggling Quality Mode allocated on the audio thread.** Switching phase mode
+changes the filter length, and the mode setter resized four coefficient vectors to
+match. That setter is reachable from `setParameters()`, which the plugin calls from
+`processBlock` — so every press of the Quality Mode button allocated on the audio
+thread, and an allocation can take a lock. Fixed by sizing every tap buffer once
+at the largest mode's length and treating a mode change as a change of tap count
+plus a fill.
+
+This one is worth dwelling on because reading the code was never going to find it:
+the allocation was three calls below the parameter setter. What found it was a test
+that replaces global `operator new`, arms a counter, and then runs 2000 blocks
+while sweeping every parameter and toggling the phase mode — asserting zero
+allocations. Real-time safety is now verified rather than asserted. (Two
+`thread_local` metering scratch buffers were caught by the same test; a function-
+local static allocates on first use, and first use was on the audio thread.)
+
+**`std::numbers` is not portable enough.** `<numbers>` is standard C++20 and GCC 13
+has it, but Apple Clang's libc++ on the macOS CI runner does not — so the build
+failed on macOS having passed on Linux. Replaced with a plain constant in
+`Common.h`. Two consequences: the CI now runs the DSP tests under both GCC and
+Clang as a fast gate, and it runs them natively on all three platforms rather than
+trusting Linux to speak for the others.
 
 **Hum probes built on LMS weights measured the wrong thing.** Deciding between
 50 and 60 Hz cannot be done from the analysis FFT — at 23 Hz bin spacing,

@@ -1,6 +1,5 @@
 #include "TonalCanceller.h"
 
-#include <numbers>
 
 namespace fbk
 {
@@ -46,7 +45,7 @@ void SinusoidCanceller::reset() noexcept
 
 void SinusoidCanceller::updateRotation() noexcept
 {
-    const double w = 2.0 * std::numbers::pi * static_cast<double> (freqHz_) / sampleRate_;
+    const double w = 2.0 * kPi * static_cast<double> (freqHz_) / sampleRate_;
     rotR_ = static_cast<float> (std::cos (w));
     rotI_ = static_cast<float> (std::sin (w));
 }
@@ -148,7 +147,7 @@ float SinusoidCanceller::process (float x) noexcept
                 // A residual frequency error of df Hz rotates the weight by
                 // 2*pi*df*interval/fs radians per interval.
                 const float dfHz = dPhase * static_cast<float> (sampleRate_)
-                                 / (2.0f * std::numbers::pi_v<float> * static_cast<float> (pllInterval_));
+                                 / (2.0f * kPiF * static_cast<float> (pllInterval_));
                 // Only trust corrections within half a bin; anything larger is
                 // a mis-track rather than a lock error.
                 const float maxCorrection = 0.5f * static_cast<float> (sampleRate_) / static_cast<float> (kFftSize);

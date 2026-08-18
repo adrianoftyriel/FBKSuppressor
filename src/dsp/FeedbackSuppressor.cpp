@@ -22,6 +22,8 @@ void FeedbackSuppressor::prepare (double sampleRate, int maxBlockSize)
 
     bandEnergy_.assign (kNumBands, 0.0f);
     separatorPresence_.assign (kNumBands, 0.0f);
+    meterBandNoise_.assign (kNumBands, 0.0f);
+    meterBandPower_.assign (kNumBands, 0.0f);
 
     paramsDirty_ = true;
     applyPhaseMode();
@@ -122,16 +124,14 @@ void FeedbackSuppressor::onAnalysisFrame() noexcept
 
         const float* bg = mask_.bandGains();
         const float* np = noise_.noisePower();
-        static thread_local std::vector<float> bandNoiseScratch (kNumBands, 0.0f);
-        static thread_local std::vector<float> bandPowerScratch (kNumBands, 0.0f);
-        bands_.binsToBands (np, bandNoiseScratch.data());
-        bands_.binsToBands (power, bandPowerScratch.data());
+        bands_.binsToBands (np, meterBandNoise_.data());
+        bands_.binsToBands (power, meterBandPower_.data());
 
         for (int b = 0; b < kNumBands; ++b)
         {
             metering_.bandGainDb[b]  = gainToDb (bg[b]);
-            metering_.bandNoiseDb[b] = 10.0f * std::log10 (bandNoiseScratch[static_cast<size_t> (b)] + kEpsilon);
-            metering_.bandInputDb[b] = 10.0f * std::log10 (bandPowerScratch[static_cast<size_t> (b)] + kEpsilon);
+            metering_.bandNoiseDb[b] = 10.0f * std::log10 (meterBandNoise_[static_cast<size_t> (b)] + kEpsilon);
+            metering_.bandInputDb[b] = 10.0f * std::log10 (meterBandPower_[static_cast<size_t> (b)] + kEpsilon);
         }
 
         metering_.speechPresence    = noise_.overallSpeechPresence();

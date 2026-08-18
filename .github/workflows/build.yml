@@ -22,14 +22,29 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Two compilers, because they disagree about more than they should. A C++20
+  # library header present in libstdc++ and absent from the macOS runner's libc++
+  # broke the build there while Linux/GCC was perfectly happy; running GCC and
+  # Clang here catches that class of problem in seconds instead of five minutes
+  # into a plugin build.
   dsp-tests:
-    name: DSP tests
+    name: DSP tests (${{ matrix.compiler }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cxx: g++
+          - compiler: clang
+            cxx: clang++
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Ninja
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang
 
       # The core DSP has no JUCE dependency, so this configures and runs in
       # seconds without fetching a plugin framework.
@@ -37,6 +52,7 @@ jobs:
         run: >
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
           -DFBK_BUILD_PLUGIN=OFF
           -DFBK_BUILD_TESTS=ON
 

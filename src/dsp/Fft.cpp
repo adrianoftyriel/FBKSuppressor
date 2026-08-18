@@ -1,7 +1,8 @@
 #include "Fft.h"
 
+#include "Common.h"
+
 #include <cmath>
-#include <numbers>
 
 namespace fbk
 {
@@ -27,7 +28,7 @@ Fft::Fft (int order)
     twiddle_.reserve (static_cast<size_t> (size_));
     for (int half = 1; half < size_; half <<= 1)
     {
-        const double step = -std::numbers::pi / static_cast<double> (half);
+        const double step = -kPi / static_cast<double> (half);
         for (int j = 0; j < half; ++j)
         {
             const double a = step * static_cast<double> (j);

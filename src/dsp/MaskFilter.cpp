@@ -1,6 +1,5 @@
 #include "MaskFilter.h"
 
-#include <numbers>
 
 namespace fbk
 {
@@ -26,6 +25,12 @@ void MaskFilter::prepare (double sampleRate, const ErbBands& bands)
     designSpec_.assign (kDesignSize, Complex {});
     cepstrum_.assign (kDesignSize, 0.0f);
 
+    // Size the tap buffers once, for the largest mode.
+    coeffs_.assign (static_cast<size_t> (kMaxTapsAnyMode), 0.0f);
+    targetCoeffs_.assign (static_cast<size_t> (kMaxTapsAnyMode), 0.0f);
+    coeffStep_.assign (static_cast<size_t> (kMaxTapsAnyMode), 0.0f);
+    history_.assign (static_cast<size_t> (kMaxTapsAnyMode), 0.0f);
+
     // Late-field decay per hop, from RT60. A 60 dB decay over rt60 seconds means
     // the energy falls by exp(-2*delta*t) with delta = 3*ln(10)/rt60.
     const double delta = 3.0 * std::log (10.0) / std::max (0.05, static_cast<double> (settings_.rt60Seconds));
@@ -37,13 +42,16 @@ void MaskFilter::prepare (double sampleRate, const ErbBands& bands)
 
 void MaskFilter::setPhaseMode (PhaseMode m) noexcept
 {
-    phaseMode_ = m;
-    numTaps_ = (m == PhaseMode::linearPhase) ? (2 * kLookaheadSamples + 1) : kMaskTaps;
+    if (coeffs_.size() < static_cast<size_t> (kMaxTapsAnyMode))
+        return;   // not prepared yet
 
-    coeffs_.assign (static_cast<size_t> (numTaps_), 0.0f);
-    targetCoeffs_.assign (static_cast<size_t> (numTaps_), 0.0f);
-    coeffStep_.assign (static_cast<size_t> (numTaps_), 0.0f);
-    history_.assign (static_cast<size_t> (numTaps_), 0.0f);
+    phaseMode_ = m;
+    numTaps_ = (m == PhaseMode::linearPhase) ? kMaxTapsAnyMode : kMaskTaps;
+
+    std::fill (coeffs_.begin(), coeffs_.end(), 0.0f);
+    std::fill (targetCoeffs_.begin(), targetCoeffs_.end(), 0.0f);
+    std::fill (coeffStep_.begin(), coeffStep_.end(), 0.0f);
+    std::fill (history_.begin(), history_.end(), 0.0f);
     historyPos_ = 0;
     interpSamplesRemaining_ = 0;
 
@@ -51,7 +59,7 @@ void MaskFilter::setPhaseMode (PhaseMode m) noexcept
     // at the centre tap for linear phase.
     const int unityTap = (m == PhaseMode::linearPhase) ? kLookaheadSamples : 0;
     coeffs_[static_cast<size_t> (unityTap)] = 1.0f;
-    targetCoeffs_ = coeffs_;
+    targetCoeffs_[static_cast<size_t> (unityTap)] = 1.0f;
 }
 
 void MaskFilter::reset() noexcept
@@ -72,9 +80,10 @@ void MaskFilter::reset() noexcept
 
     const int unityTap = (phaseMode_ == PhaseMode::linearPhase) ? kLookaheadSamples : 0;
     std::fill (coeffs_.begin(), coeffs_.end(), 0.0f);
-    coeffs_[static_cast<size_t> (unityTap)] = 1.0f;
-    targetCoeffs_ = coeffs_;
+    std::fill (targetCoeffs_.begin(), targetCoeffs_.end(), 0.0f);
     std::fill (coeffStep_.begin(), coeffStep_.end(), 0.0f);
+    coeffs_[static_cast<size_t> (unityTap)] = 1.0f;
+    targetCoeffs_[static_cast<size_t> (unityTap)] = 1.0f;
 }
 
 bool MaskFilter::updateMask (const float* power, const NoiseTracker& noise) noexcept
@@ -262,7 +271,7 @@ void MaskFilter::designMinimumPhase (const float* binGains) noexcept
         if (fromEnd < taper)
         {
             const float x = static_cast<float> (fromEnd) / static_cast<float> (taper);
-            w = 0.5f - 0.5f * std::cos (std::numbers::pi_v<float> * x);
+            w = 0.5f - 0.5f * std::cos (kPiF * x);
         }
         float v = designSpec_[static_cast<size_t> (t)].real() * w;
         if (! std::isfinite (v))
@@ -301,7 +310,7 @@ void MaskFilter::designLinearPhase (const float* binGains) noexcept
         idx %= n;
 
         // Hann window over the full tap range.
-        const float w = 0.5f - 0.5f * std::cos (2.0f * std::numbers::pi_v<float>
+        const float w = 0.5f - 0.5f * std::cos (2.0f * kPiF
                         * static_cast<float> (t) / static_cast<float> (numTaps_ - 1));
         float v = designSpec_[static_cast<size_t> (idx)].real() * w;
         if (! std::isfinite (v))
@@ -319,7 +328,7 @@ float MaskFilter::process (float x) noexcept
         for (int t = 0; t < numTaps_; ++t)
             coeffs_[static_cast<size_t> (t)] += coeffStep_[static_cast<size_t> (t)];
         if (interpSamplesRemaining_ == 0)
-            coeffs_ = targetCoeffs_;
+            std::copy (targetCoeffs_.begin(), targetCoeffs_.begin() + numTaps_, coeffs_.begin());
     }
 
     // Circular-buffer FIR. historyPos_ holds the newest sample.

@@ -135,6 +135,12 @@ private:
     std::vector<Complex> designSpec_;   // kDesignSize
     std::vector<float> cepstrum_;
 
+    // All tap buffers are sized once, at the maximum any phase mode needs, so
+    // switching mode is a change of numTaps_ and a fill - never a reallocation.
+    // setPhaseMode() is reachable from setParameters(), which the plugin calls
+    // from processBlock, so an allocation here would be an allocation on the
+    // audio thread every time the Quality Mode button is pressed.
+    static constexpr int kMaxTapsAnyMode = 2 * kLookaheadSamples + 1;
     int numTaps_ { kMaskTaps };
     std::vector<float> coeffs_, targetCoeffs_, coeffStep_;
     std::vector<float> history_;
