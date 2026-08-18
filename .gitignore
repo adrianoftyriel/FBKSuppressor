@@ -1,0 +1,10 @@
+build/
+build-*/
+cmake-build-*/
+.cache/
+.vscode/
+.idea/
+.DS_Store
+*.user
+Builds/
+JuceLibraryCode/
