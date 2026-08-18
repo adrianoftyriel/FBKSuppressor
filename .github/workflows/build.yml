@@ -1,0 +1,228 @@
+name: Build
+
+# Artifacts are produced for every push to dev and to the working branch, so
+# there is always something downloadable to test with. The DSP tests gate the
+# plugin builds: if the signal processing is wrong there is no point compiling
+# three platforms' worth of plugin.
+on:
+  push:
+    branches: [dev, 'claude/**']
+  pull_request:
+    branches: [dev]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: Release
+  # Bump this in one place to move to a new JUCE release.
+  JUCE_TAG: "8.0.15"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  dsp-tests:
+    name: DSP tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      # The core DSP has no JUCE dependency, so this configures and runs in
+      # seconds without fetching a plugin framework.
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DFBK_BUILD_PLUGIN=OFF
+          -DFBK_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run tests
+        run: ./build/tests/fbk_tests
+
+  # ---------------------------------------------------------------------------
+  build:
+    name: ${{ matrix.name }}
+    needs: dsp-tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows (VST3 + Standalone)
+            os: windows-latest
+            artifact: FBKSuppressor-Windows
+            cmake_extra: ""
+          - name: macOS (VST3 + AU + Standalone, universal)
+            os: macos-latest
+            artifact: FBKSuppressor-macOS
+            cmake_extra: '-DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"'
+          - name: Linux (VST3 + Standalone)
+            os: ubuntu-latest
+            artifact: FBKSuppressor-Linux
+            cmake_extra: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build \
+            libasound2-dev libjack-jackd2-dev \
+            libx11-dev libxext-dev libxrandr-dev libxinerama-dev libxcursor-dev \
+            libfreetype-dev libfontconfig1-dev \
+            libgl1-mesa-dev libglu1-mesa-dev
+
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Install Ninja (Windows)
+        if: runner.os == 'Windows'
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # JUCE is a large shallow clone. Caching it keyed on the tag turns a
+      # multi-minute fetch into a few seconds on every run after the first.
+      - name: Cache JUCE
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: juce-${{ runner.os }}-${{ env.JUCE_TAG }}-v1
+
+      - name: Configure
+        shell: bash
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DFBK_BUILD_PLUGIN=ON
+          -DFBK_BUILD_TESTS=ON
+          -DFBK_JUCE_TAG=${{ env.JUCE_TAG }}
+          ${{ matrix.cmake_extra }}
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --parallel
+
+      - name: Run DSP tests on this platform
+        shell: bash
+        run: |
+          # Catch anything that is platform specific - a different float
+          # evaluation order, a different denormal mode - rather than trusting
+          # that Linux passing means Windows and macOS pass.
+          if [ -f build/tests/fbk_tests ]; then
+            ./build/tests/fbk_tests
+          elif [ -f build/tests/fbk_tests.exe ]; then
+            ./build/tests/fbk_tests.exe
+          else
+            echo "test binary not found" && exit 1
+          fi
+
+      - name: Collect artefacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          root="build/src/plugin/FBKSuppressor_artefacts/${BUILD_TYPE}"
+          if [ ! -d "$root" ]; then
+            root="build/src/plugin/FBKSuppressor_artefacts"
+          fi
+          echo "Collecting from $root"
+          find "$root" -maxdepth 2 -mindepth 1 \
+            \( -name '*.vst3' -o -name '*.component' -o -name 'FBKSuppressor' \
+               -o -name 'FBKSuppressor.exe' -o -name 'FBKSuppressor.app' \) \
+            -exec cp -R {} staging/ \;
+          ls -laR staging
+
+      - name: Remove macOS quarantine attributes
+        if: runner.os == 'macOS'
+        run: xattr -cr staging || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: staging/
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Host-compatibility validation, kept in a separate job on purpose: a problem
+  # fetching or running pluginval must never stop the builds above from producing
+  # something downloadable.
+  validate:
+    name: pluginval (${{ matrix.os }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: FBKSuppressor-Linux
+            asset: pluginval_Linux.zip
+          - os: windows-latest
+            artifact: FBKSuppressor-Windows
+            asset: pluginval_Windows.zip
+          - os: macos-latest
+            artifact: FBKSuppressor-macOS
+            asset: pluginval_macOS.zip
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: plugin
+
+      - name: Install Linux runtime dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2t64 libfreetype6 libfontconfig1 \
+            libx11-6 libxext6 libxrandr2 libxinerama1 libxcursor1 xvfb
+
+      - name: Fetch pluginval
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSL -o pluginval.zip \
+            "https://github.com/Tracktion/pluginval/releases/latest/download/${{ matrix.asset }}"
+          unzip -q pluginval.zip -d pluginval
+
+      # Strictness 5 is the level that exercises parameter handling, state
+      # save/restore and, importantly here, repeated prepareToPlay calls at
+      # varying block sizes and sample rates - which is exactly the behaviour a
+      # zero-latency processor has to get right.
+      - name: Validate VST3 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          chmod +x pluginval/pluginval
+          xvfb-run -a ./pluginval/pluginval \
+            --strictness-level 5 --validate-in-process --timeout-ms 300000 \
+            --validate plugin/FBKSuppressor.vst3
+
+      - name: Validate VST3 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          chmod +x pluginval/pluginval.app/Contents/MacOS/pluginval
+          ./pluginval/pluginval.app/Contents/MacOS/pluginval \
+            --strictness-level 5 --validate-in-process --timeout-ms 300000 \
+            --validate plugin/FBKSuppressor.vst3
+
+      - name: Validate VST3 (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          ./pluginval/pluginval.exe \
+            --strictness-level 5 --validate-in-process --timeout-ms 300000 \
+            --validate plugin/FBKSuppressor.vst3
