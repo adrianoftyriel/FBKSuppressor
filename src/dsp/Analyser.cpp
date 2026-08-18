@@ -44,8 +44,6 @@ void Analyser::prepare (double sampleRate)
     spectrum_.assign (kFftSize, Complex {});
     magnitude_.assign (kNumBins, 0.0f);
     power_.assign (kNumBins, 0.0f);
-    phase_.assign (kNumBins, 0.0f);
-    prevPhase_.assign (kNumBins, 0.0f);
 
     reset();
 }
@@ -55,8 +53,6 @@ void Analyser::reset() noexcept
     std::fill (ring_.begin(), ring_.end(), 0.0f);
     std::fill (magnitude_.begin(), magnitude_.end(), 0.0f);
     std::fill (power_.begin(), power_.end(), 0.0f);
-    std::fill (phase_.begin(), phase_.end(), 0.0f);
-    std::fill (prevPhase_.begin(), prevPhase_.end(), 0.0f);
     writePos_ = 0;
     hopCounter_ = 0;
     frameIndex_ = 0;
@@ -88,7 +84,6 @@ void Analyser::computeFrame() noexcept
 
     fft_.forwardReal (framed_.data(), spectrum_.data());
 
-    std::swap (phase_, prevPhase_);
     for (int k = 0; k < kNumBins; ++k)
     {
         const Complex c = spectrum_[static_cast<size_t> (k)];
@@ -96,7 +91,6 @@ void Analyser::computeFrame() noexcept
         const float p  = re * re + im * im;
         power_[static_cast<size_t> (k)]     = p;
         magnitude_[static_cast<size_t> (k)] = std::sqrt (p);
-        phase_[static_cast<size_t> (k)]     = std::atan2 (im, re);
     }
 }
 } // namespace fbk

@@ -77,7 +77,7 @@ The header shows measured CPU as a percentage of real time for the current block
 Check it at the buffer size you will actually run, with every instance you will
 actually run, before the show rather than during it.
 
-The test suite measures 4.4% of one core per mono channel at a 16-sample buffer
+The test suite measures 3.1% of one core per mono channel at a 16-sample buffer
 with all stages active, but your machine, buffer size and channel count are what
 matter.
 

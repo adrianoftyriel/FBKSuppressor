@@ -47,8 +47,13 @@ public:
     const Complex* spectrum()  const noexcept { return spectrum_.data(); }
     const float*   magnitude() const noexcept { return magnitude_.data(); }   // kNumBins
     const float*   power()     const noexcept { return power_.data(); }       // kNumBins
-    const float*   phase()     const noexcept { return phase_.data(); }       // kNumBins
-    const float*   previousPhase() const noexcept { return prevPhase_.data(); }
+
+    // No phase output. Nothing downstream needs it: the detector works on
+    // magnitude, and frequency is recovered to sub-bin accuracy by parabolic
+    // interpolation plus the cancellers' own phase-locked loops - which is more
+    // accurate than a per-bin phase difference anyway. Computing it cost an
+    // atan2 per bin per frame (~384k per second at a 128-sample hop) for nothing,
+    // which is real money in a chain this small.
 
     long long frameIndex() const noexcept { return frameIndex_; }
     double sampleRate() const noexcept { return sampleRate_; }
@@ -74,6 +79,6 @@ private:
 
     std::vector<float>   framed_;      // windowed time-domain frame
     std::vector<Complex> spectrum_;
-    std::vector<float>   magnitude_, power_, phase_, prevPhase_;
+    std::vector<float>   magnitude_, power_;
 };
 } // namespace fbk

@@ -119,7 +119,7 @@ void FeedbackSuppressor::onAnalysisFrame() noexcept
         {
             metering_.toneFrequencies[i]   = tones[i].active ? tones[i].freqHz : 0.0f;
             metering_.toneConfidence[i]    = tones[i].active ? tones[i].confidence : 0.0f;
-            metering_.toneAttenuationDb[i] = 0.0f;
+            metering_.toneAttenuationDb[i] = tones[i].active ? tonal_.attenuationDb (i) : 0.0f;
         }
 
         const float* bg = mask_.bandGains();

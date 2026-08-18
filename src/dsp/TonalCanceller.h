@@ -150,7 +150,16 @@ public:
     float process (float x) noexcept;
 
     int numEngaged() const noexcept { return numEngaged_; }
-    float totalAttenuationDb() const noexcept;
+
+    // Measured attenuation achieved by canceller i, in dB. Per-canceller because
+    // summing dB figures across cancellers - which an earlier version did - is
+    // not a meaningful quantity.
+    float attenuationDb (int index) const noexcept
+    {
+        if (index < 0 || index >= static_cast<int> (cancellers_.size()))
+            return 0.0f;
+        return cancellers_[static_cast<size_t> (index)].attenuationDb();
+    }
 
 private:
     std::vector<SinusoidCanceller> cancellers_;

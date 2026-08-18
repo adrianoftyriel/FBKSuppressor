@@ -97,7 +97,7 @@ milliseconds.
 
 ## 4. Cost, and why not GPU
 
-Measured: **4.4% of one core** per mono channel with every stage enabled, at a
+Measured: **3.1% of one core** per mono channel with every stage enabled, at a
 16-sample buffer — and flat from 16 to 512 samples, which confirms there is no
 per-block overhead. The chain is driven sample-by-sample off an internal hop
 counter, so host buffering is not observable in the output at all (verified
@@ -110,6 +110,12 @@ The two things that make this affordable:
 - The broadband mask is redesigned every 4 hops (~10 ms) and its coefficients are
   interpolated between designs. Only the tone tracker needs to be fast; a noise
   floor does not move in 2.7 ms.
+- The analyser computes magnitude and power but not phase. An earlier version
+  computed a per-bin phase and a previous-frame phase that nothing ever read -
+  around 384k `atan2` calls per second of pure waste. Deleting it cut the measured
+  cost from 4.4% of a core to 3.1%, a 29% reduction, which is worth knowing about
+  as a general point: in a chain this small, one unused transcendental per bin per
+  frame is a third of the budget.
 
 **GPU and NPU were considered and rejected for the main path.** At 16–64 sample
 buffers, per-buffer transfer and kernel-launch overhead exceeds the entire compute

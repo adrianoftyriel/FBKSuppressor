@@ -76,7 +76,7 @@ GCC and Clang):
 | Held sung note (false-positive test) | **0.00 dB** change, 0 detections |
 | Voice spectrum, 100 Hz–6 kHz | worst band **0.82 dB**, mean **0.46 dB** |
 | Mains hum, 50 / 60 Hz auto-selected | −85.2 / −81.9 dB |
-| CPU, all stages on, 16-sample buffer | **4.4% of one core** per mono channel |
+| CPU, all stages on, 16-sample buffer | **3.1% of one core** per mono channel |
 | 20 s of silence after hostile input | 8.8e−24 |
 | Allocations on the audio thread, 2000 blocks + parameter sweeps | **0** |
 | pluginval, strictness level 5 (VST3) | passes |
@@ -146,12 +146,18 @@ cmake --build build --parallel
 ./build/tests/fbk_tests
 ```
 
-The core DSP is a JUCE-free C++20 library, so the tests configure and run in
-seconds without fetching a plugin framework:
+Expect the full plugin build to take several minutes: JUCE's recommended
+link-time-optimisation flags are enabled, and LTO linking is slow and largely
+serial. For iterating on the signal processing, build the core alone — it is a
+JUCE-free C++20 library, so this configures, compiles and runs the whole test
+suite in seconds:
 
 ```sh
-cmake -S . -B build -G Ninja -DFBK_BUILD_PLUGIN=OFF
+cmake -S . -B build-dsp -G Ninja -DFBK_BUILD_PLUGIN=OFF
+cmake --build build-dsp --parallel && ./build-dsp/tests/fbk_tests
 ```
+
+Or just `./scripts/build.sh dsp`.
 
 Linux plugin builds need: `libasound2-dev libx11-dev libxext-dev libxrandr-dev
 libxinerama-dev libxcursor-dev libfreetype-dev libfontconfig1-dev libgl1-mesa-dev`.

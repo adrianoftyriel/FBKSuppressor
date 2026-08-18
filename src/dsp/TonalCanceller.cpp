@@ -260,14 +260,6 @@ float TonalCanceller::process (float x) noexcept
     return x;
 }
 
-float TonalCanceller::totalAttenuationDb() const noexcept
-{
-    float sum = 0.0f;
-    for (const auto& c : cancellers_)
-        sum += c.attenuationDb();
-    return sum;
-}
-
 // ===========================================================================
 // HumCanceller
 // ===========================================================================
