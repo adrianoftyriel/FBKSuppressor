@@ -428,7 +428,37 @@ Training needs the DNS-Challenge corpus (~1 TB unpacked: 827 GB clean speech,
 58 GB noise, 5.9 GB impulse responses, plus 60k RIRs from SLR28) with closed-loop
 feedback simulation, and GPU hours. Both are out of scope for the v0.1 build.
 
-## 15. v0.3: sidechain AFC
+## 15. Publishing
+
+Releases are published from the same workflow run that built and validated the
+binaries, rather than from a separate release workflow triggered afterwards. The
+reason is narrow but important: a release must ship the exact artifacts that were
+tested. Two workflows means two builds of the same commit, and two builds can differ
+- a different runner image, a cache miss that pulls a different JUCE, a toolchain
+patch release. Publishing what this run produced removes that possibility entirely.
+
+Publishing is gated on both the platform builds and pluginval. That is a deliberate
+change of posture from the artifact-only path, where validation is intentionally
+kept in a separate job so a failure to fetch pluginval can never cost you a
+downloadable build. For a *release* the trade runs the other way: an unvalidated
+binary should not be tagged, and the artifacts are still downloadable from the run
+even when publishing declines.
+
+`dev` publishes pre-releases tagged with the run number, so no version bump is
+needed to iterate. `main` publishes releases at the version in `CMakeLists.txt`, and
+refuses to publish if that tag already exists - overwriting a release would silently
+replace binaries someone may already be running, so it is a hard stop with an
+actionable message rather than a warning.
+
+Two shell details worth recording, because both are the kind of thing that only
+fails once it matters. Bundles are zipped with `-y` so symlinks are stored as
+symlinks; without it macOS `.vst3` and `.component` bundles arrive subtly broken.
+And the changelog uses `git log -n 60` rather than piping into `head -60`: under
+`set -o pipefail`, `head` closes the pipe once satisfied, git dies of SIGPIPE with
+status 141, and the step fails - but only once the changelog exceeds sixty commits,
+which is to say only on a release big enough to care about.
+
+## 16. v0.3: sidechain AFC
 
 With the loudspeaker signal available as a reference, the feedback path itself can
 be estimated and subtracted, which removes *zero* voice energy rather than very

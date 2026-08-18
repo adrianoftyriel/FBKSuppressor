@@ -1,14 +1,25 @@
 name: Build
 
-# Artifacts are produced for every push to dev and to the working branch, so
+# Artifacts are produced for every push to main, dev and the working branch, so
 # there is always something downloadable to test with. The DSP tests gate the
 # plugin builds: if the signal processing is wrong there is no point compiling
 # three platforms' worth of plugin.
+#
+# Publishing is layered on top of the same run rather than split into a separate
+# workflow: a release must ship the exact binaries that were tested, and the
+# simplest way to guarantee that is to publish the artifacts this run produced.
+#
+#   push to dev   -> pre-release, tagged vX.Y.Z-dev.<run number>
+#   push to main  -> release,     tagged vX.Y.Z
+#
+# The version comes from CMakeLists.txt, which is the single source of truth. A
+# main merge whose version already has a release fails loudly rather than
+# overwriting it.
 on:
   push:
-    branches: [dev, 'claude/**']
+    branches: [main, dev, 'claude/**']
   pull_request:
-    branches: [dev]
+    branches: [main, dev]
   workflow_dispatch:
 
 concurrency:
@@ -273,3 +284,196 @@ jobs:
           ./pluginval/pluginval.exe \
             --strictness-level 5 --validate-in-process --timeout-ms 300000 \
             --validate plugin/FBKSuppressor.vst3
+
+  # ---------------------------------------------------------------------------
+  # Publishing. Gated on both the builds and the validation: an unvalidated
+  # binary has no business being a release, and the artifacts remain downloadable
+  # from the run itself even when this job declines to publish.
+  publish:
+    name: Publish ${{ github.ref_name == 'main' && 'release' || 'pre-release' }}
+    needs: [build, validate]
+    if: >-
+      github.event_name == 'push'
+      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # Full history and tags, so the changelog can be generated against the
+      # previous release rather than guessed.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Work out the version and tag
+        id: meta
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          version=$(sed -n 's/^project(FBKSuppressor[[:space:]]\+VERSION[[:space:]]\+\([0-9.]*\).*/\1/p' CMakeLists.txt | head -1)
+          if [ -z "$version" ]; then
+            echo "::error::Could not read the version from CMakeLists.txt"
+            exit 1
+          fi
+
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            tag="v${version}"
+            title="FBKSuppressor ${tag}"
+            prerelease=false
+
+            # Refuse to clobber an existing release. Publishing twice over the same
+            # tag would silently replace binaries someone may already have
+            # downloaded, so this is a hard stop with an actionable message.
+            if gh release view "$tag" >/dev/null 2>&1; then
+              echo "::error::Release $tag already exists. Bump the version in CMakeLists.txt before merging to main."
+              exit 1
+            fi
+          else
+            # Pre-release tags carry the run number, so every push to dev produces a
+            # distinct, ordered tag without anyone having to bump anything.
+            tag="v${version}-dev.${{ github.run_number }}"
+            title="FBKSuppressor ${tag} (pre-release)"
+            prerelease=true
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "Publishing $tag (prerelease=$prerelease)"
+
+      - name: Package each platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          mkdir -p dist
+
+          shopt -s nullglob
+          found=0
+          for dir in artifacts/FBKSuppressor-*; do
+            [ -d "$dir" ] || continue
+            platform="${dir##*/FBKSuppressor-}"
+            # -y preserves symlinks, which macOS .vst3 and .component bundles rely
+            # on; without it the bundles arrive subtly broken.
+            ( cd "$dir" && zip -q -r -y "../../dist/FBKSuppressor-${version}-${platform}.zip" . )
+            found=$((found + 1))
+          done
+
+          if [ "$found" -eq 0 ]; then
+            echo "::error::No build artifacts were found to publish"
+            exit 1
+          fi
+
+          ( cd dist && sha256sum *.zip > SHA256SUMS.txt )
+          ls -la dist
+
+      - name: Compose release notes
+        id: notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Compare against the previous release of the same kind: a full release
+          # against the last full release, a pre-release against whatever came last.
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            previous=$(gh release list --limit 100 --json tagName,isPrerelease,createdAt \
+              --jq '[.[] | select(.isPrerelease == false)] | sort_by(.createdAt) | last | .tagName // ""' || echo "")
+          else
+            previous=$(gh release list --limit 100 --json tagName,createdAt \
+              --jq 'sort_by(.createdAt) | last | .tagName // ""' || echo "")
+          fi
+
+          {
+            if [ "${{ github.ref_name }}" = "dev" ]; then
+              echo "Automated pre-release from \`dev\`. Built and validated, but not a stable release."
+              echo
+            fi
+
+            echo "Commit \`${GITHUB_SHA:0:8}\`. All builds passed the DSP suite on their own"
+            echo "platform, and every VST3 passed pluginval at strictness level 5."
+            echo
+
+            echo "## Downloads"
+            echo
+            echo "| File | Contains |"
+            echo "|---|---|"
+            for f in dist/FBKSuppressor-*-Windows.zip;  do [ -e "$f" ] && echo "| \`$(basename "$f")\` | VST3 + standalone |"; done
+            for f in dist/FBKSuppressor-*-macOS.zip;    do [ -e "$f" ] && echo "| \`$(basename "$f")\` | VST3 + AU + standalone, universal |"; done
+            for f in dist/FBKSuppressor-*-Linux.zip;    do [ -e "$f" ] && echo "| \`$(basename "$f")\` | VST3 + standalone |"; done
+            echo "| \`SHA256SUMS.txt\` | Checksums |"
+            echo
+
+            echo "## Installing"
+            echo
+            echo "**Windows** - copy \`FBKSuppressor.vst3\` to \`C:\\Program Files\\Common Files\\VST3\\\`."
+            echo
+            echo "**macOS** - copy \`FBKSuppressor.vst3\` to \`/Library/Audio/Plug-Ins/VST3/\` and"
+            echo "\`FBKSuppressor.component\` to \`/Library/Audio/Plug-Ins/Components/\`. These builds are"
+            echo "**not code-signed or notarised**, so Gatekeeper will block them until you clear the"
+            echo "quarantine flag:"
+            echo
+            echo '```sh'
+            echo "xattr -dr com.apple.quarantine /Library/Audio/Plug-Ins/VST3/FBKSuppressor.vst3"
+            echo "xattr -dr com.apple.quarantine /Library/Audio/Plug-Ins/Components/FBKSuppressor.component"
+            echo '```'
+            echo
+            echo "**Standalone** - run it directly. Lowest achievable round trip, since there is no host"
+            echo "buffering in the path."
+            echo
+
+            echo "## First checks"
+            echo
+            echo "Set **Strength** to 0% and null against the dry signal: it must cancel to digital"
+            echo "silence. That verifies the host is compensating honestly before you trust anything"
+            echo "else. See \`docs/VERIFYING.md\` for the rest, and calibrate against your most"
+            echo "difficult voice - a high, steady one is the worst case for false positives, not a"
+            echo "loud one."
+            echo
+
+            echo "## Changes"
+            echo
+            if [ -n "$previous" ] && git rev-parse -q --verify "refs/tags/$previous" >/dev/null; then
+              echo "Since \`$previous\`:"
+              echo
+              git log --no-merges --pretty=format:'- %s' -n 60 "refs/tags/${previous}..HEAD"
+              echo
+            else
+              echo "Recent commits:"
+              echo
+              git log --no-merges --pretty=format:'- %s' -20
+              echo
+            fi
+          } > release-notes.md
+
+          echo "Composed notes:"
+          cat release-notes.md
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          args=(
+            "${{ steps.meta.outputs.tag }}"
+            --target "${{ github.sha }}"
+            --title "${{ steps.meta.outputs.title }}"
+            --notes-file release-notes.md
+          )
+          if [ "${{ steps.meta.outputs.prerelease }}" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "${args[@]}" dist/*
+
+          echo "### Published [${{ steps.meta.outputs.tag }}](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ steps.meta.outputs.tag }})" >> "$GITHUB_STEP_SUMMARY"

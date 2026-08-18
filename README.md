@@ -88,10 +88,37 @@ core for one instance at a comparable buffer size.
 
 ---
 
+## Releases
+
+| Branch | Publishes | Tag |
+|---|---|---|
+| `dev` | **pre-release** | `v0.1.0-dev.<run number>` |
+| `main` | **release** | `v0.1.0` |
+
+Every push to either branch builds all three platforms, runs the DSP suite on each
+of them, validates every VST3 with pluginval, and only then publishes. The release
+carries the exact binaries that were tested — publishing happens in the same run as
+the build rather than in a separate workflow, so there is no way for the two to
+drift apart.
+
+Each release contains a zip per platform plus `SHA256SUMS.txt`, and notes with
+install instructions and the changelog since the previous release of the same kind.
+
+**The version lives in `CMakeLists.txt`** (`project(FBKSuppressor VERSION x.y.z)`)
+and is the single source of truth. Pre-release tags append the run number, so `dev`
+never needs a bump. A **release** does: if `v<version>` already exists, the publish
+step fails with a message rather than overwriting binaries you may already have
+downloaded. So the flow for a real release is bump the version in `CMakeLists.txt`,
+merge to `dev`, check the pre-release, then merge to `main`.
+
+Note that pre-releases accumulate — one per push to `dev`. Nothing prunes them
+automatically, because deleting releases is not something I'll do unasked; say the
+word if you want old ones cleaned up on a rolling basis.
+
 ## Installing
 
-Builds are produced by GitHub Actions on every push. Open the latest run under
-**Actions**, and download the artifact for your platform.
+Grab the latest [release or pre-release](../../releases), or for an untagged build,
+open a run under **Actions** and download the artifact for your platform.
 
 **Windows** — copy `FBKSuppressor.vst3` to
 `C:\Program Files\Common Files\VST3\`.
