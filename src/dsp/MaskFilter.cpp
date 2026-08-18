@@ -129,6 +129,10 @@ bool MaskFilter::updateMask (const float* power, const NoiseTracker& noise) noex
 
         float gain = 1.0f;
 
+        const float bandProtection = settings_.voiceProtectionPerBand != nullptr
+                                   ? settings_.voiceProtectionPerBand[b]
+                                   : settings_.voiceProtection;
+
         if (settings_.denoiseEnabled)
         {
             const float nse = bandNoise_[i] + kEpsilon;
@@ -153,7 +157,7 @@ bool MaskFilter::updateMask (const float* power, const NoiseTracker& noise) noex
             // Voice protection: where speech is clearly present, pull the gain
             // back towards unity. This is the difference between a mask that
             // works in the gaps and one that chews on the voice itself.
-            const float protect = settings_.voiceProtection * presence[i];
+            const float protect = bandProtection * presence[i];
             g = g + protect * (1.0f - g);
 
             gain *= std::max (g, floorNoise);
@@ -164,7 +168,7 @@ bool MaskFilter::updateMask (const float* power, const NoiseTracker& noise) noex
             const float r = settings_.dereverbAmount * lateReverb_[i];
             float g = (p - r) / p;
             g = clampf (g, 0.0f, 1.0f);
-            const float protect = settings_.voiceProtection * presence[i] * 0.5f;
+            const float protect = bandProtection * presence[i] * 0.5f;
             g = g + protect * (1.0f - g);
             gain *= std::max (g, floorReverb);
         }

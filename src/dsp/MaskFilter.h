@@ -75,6 +75,12 @@ struct MaskSettings
 
     // How strongly speech presence protects a band from attenuation.
     float voiceProtection { 0.8f };        // 0..1
+
+    // Optional per-band override, from a calibration profile's long-term average
+    // spectrum: bands carrying more of this particular voice get protected harder.
+    // Null means use the scalar above for every band. The pointed-to storage must
+    // outlive the MaskFilter, and in practice is owned by FeedbackSuppressor.
+    const float* voiceProtectionPerBand { nullptr };
 };
 
 class MaskFilter

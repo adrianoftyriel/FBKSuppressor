@@ -11,6 +11,7 @@ void FeedbackSuppressor::prepare (double sampleRate, int maxBlockSize)
 
     bands_.prepare (sampleRate_);
     analyser_.prepare (sampleRate_);
+    calibrator_.prepare (sampleRate_, bands_);
     noise_.prepare (sampleRate_, bands_);
     detector_.prepare (sampleRate_, bands_);
     tonal_.prepare (sampleRate_);
@@ -24,6 +25,8 @@ void FeedbackSuppressor::prepare (double sampleRate, int maxBlockSize)
     separatorPresence_.assign (kNumBands, 0.0f);
     meterBandNoise_.assign (kNumBands, 0.0f);
     meterBandPower_.assign (kNumBands, 0.0f);
+    bandProtection_.assign (kNumBands, 0.8f);
+    modePriors_.assign (kMaxRoomModes, 0.0f);
 
     paramsDirty_ = true;
     applyPhaseMode();
@@ -77,9 +80,74 @@ void FeedbackSuppressor::setParameters (const Parameters& p) noexcept
     ms.dereverbAmount  = params_.dereverbAmount;
     ms.rt60Seconds     = params_.rt60Seconds;
     ms.voiceProtection = params_.voiceProtection;
+    ms.voiceProtectionPerBand = profileApplied_ ? bandProtection_.data() : nullptr;
     mask_.setSettings (ms);
 
     highPass_.setCutoff (params_.highPassHz);
+}
+
+void FeedbackSuppressor::beginCalibration (CalibrationPhase phase) noexcept
+{
+    calibrator_.begin (phase);
+
+    // While measuring a voice, the detector observes but never confirms, so the
+    // plugin cannot act on the signal it is characterising. During the room-mode
+    // phase the opposite is true: cancellation must stay fully active, because
+    // being protected is what makes pushing the gain safe.
+    detector_.setObserveOnly (phase == CalibrationPhase::voice);
+}
+
+void FeedbackSuppressor::finishCalibration() noexcept
+{
+    calibrator_.finish();
+    detector_.setObserveOnly (false);
+}
+
+void FeedbackSuppressor::cancelCalibration() noexcept
+{
+    calibrator_.cancel();
+    detector_.setObserveOnly (false);
+}
+
+void FeedbackSuppressor::applyProfile (const VoiceProfile& p) noexcept
+{
+    if (! p.valid)
+        return;
+
+    if (p.hasSuggestions)
+        detector_.setCalibratedThresholds (p.suggestedPnprDb,
+                                           p.suggestedPhprDb,
+                                           p.suggestedFsdMaxHz,
+                                           p.suggestedAbsoluteFloorDb,
+                                           p.suggestedLocalProminenceDb);
+
+    if (p.hasVoice)
+    {
+        for (int b = 0; b < kNumBands; ++b)
+            bandProtection_[static_cast<size_t> (b)] = clampf (p.suggestedVoiceProtection[b], 0.0f, 1.0f);
+    }
+
+    if (p.numModes > 0)
+    {
+        const int n = std::min (p.numModes, kMaxRoomModes);
+        for (int i = 0; i < n; ++i)
+            modePriors_[static_cast<size_t> (i)] = p.modes[i].freqHz;
+        detector_.setModePriors (modePriors_.data(), n);
+    }
+
+    profileApplied_ = true;
+    params_.profileApplied = true;
+    setParameters (params_);   // re-push, so MaskSettings picks up the per-band array
+}
+
+void FeedbackSuppressor::clearProfile() noexcept
+{
+    detector_.clearCalibratedThresholds();
+    detector_.clearModePriors();
+    std::fill (bandProtection_.begin(), bandProtection_.end(), params_.voiceProtection);
+    profileApplied_ = false;
+    params_.profileApplied = false;
+    setParameters (params_);
 }
 
 void FeedbackSuppressor::onAnalysisFrame() noexcept
@@ -89,6 +157,28 @@ void FeedbackSuppressor::onAnalysisFrame() noexcept
 
     noise_.update (power);
     detector_.process (magnitude);
+
+    if (calibrator_.isRunning())
+    {
+        calibrator_.processFrame (power, magnitude, detector_);
+
+        // Room-mode phase: report whatever the cancellers are actually working on.
+        // This is the measurement - the frequencies the suppressor had to fight
+        // while the gain was pushed - and it only exists because cancellation is
+        // left on throughout.
+        if (calibrator_.phase() == CalibrationPhase::roomModes)
+        {
+            const float frameSeconds = static_cast<float> (kHopSize / sampleRate_);
+            const TrackedTone* tones = detector_.tones();
+            for (int i = 0; i < detector_.numTones(); ++i)
+            {
+                const auto& t = tones[i];
+                if (t.active && t.confidence > 0.5f)
+                    calibrator_.reportEngagedTone (t.freqHz, t.pnprDb,
+                                                   frameSeconds * t.confidence);
+            }
+        }
+    }
 
     // v0.2: if a learned separator is attached, hand it the band energies. Its
     // per-band voice presence is intended to replace the heuristic estimate. The

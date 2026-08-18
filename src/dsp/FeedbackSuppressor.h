@@ -27,6 +27,7 @@
 
 #include "Analyser.h"
 #include "Biquad.h"
+#include "Calibration.h"
 #include "CaptureRing.h"
 #include "Common.h"
 #include "ErbBands.h"
@@ -64,6 +65,10 @@ struct Parameters
 
     bool  highPassEnabled { true };
     float highPassHz { 35.0f };
+
+    // Set when a calibration profile has been applied. Purely informational for
+    // the UI; the profile's effects are pushed into the components directly.
+    bool  profileApplied { false };
 };
 
 struct Metering
@@ -101,6 +106,23 @@ public:
 
     const Metering& metering() const noexcept { return metering_; }
     CaptureRing& captureRing() noexcept { return capture_; }
+
+    // --- Calibration ------------------------------------------------------
+    // Explicit-apply only: beginCalibration/finishCalibration measure, and
+    // applyProfile is a separate deliberate act. Measuring never changes
+    // behaviour, so a calibration pass cannot surprise anyone mid-show.
+    void beginCalibration (CalibrationPhase phase) noexcept;
+    void finishCalibration() noexcept;
+    void cancelCalibration() noexcept;
+    CalibrationPhase calibrationPhase() const noexcept { return calibrator_.phase(); }
+    float calibrationProgress() const noexcept { return calibrator_.progress(); }
+    float calibrationElapsedSeconds() const noexcept { return calibrator_.elapsedSeconds(); }
+    const VoiceProfile& profile() const noexcept { return calibrator_.profile(); }
+    Calibrator& calibrator() noexcept { return calibrator_; }
+
+    void applyProfile (const VoiceProfile&) noexcept;
+    void clearProfile() noexcept;
+    bool hasProfileApplied() const noexcept { return profileApplied_; }
 
     // v0.2 hook. Ownership stays with the caller; pass nullptr to revert to the
     // heuristic presence estimate.
@@ -142,6 +164,12 @@ private:
     // thread_local static would allocate on first use, and first use is on the
     // audio thread.
     std::vector<float> meterBandNoise_, meterBandPower_;
+
+    Calibrator calibrator_;
+    bool profileApplied_ { false };
+    // Owned copy, because MaskSettings holds a pointer into it.
+    std::vector<float> bandProtection_;
+    std::vector<float> modePriors_;
 
     Metering metering_ {};
     int meterFrameCounter_ { 0 };

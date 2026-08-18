@@ -24,6 +24,9 @@ void HowlDetector::prepare (double sampleRate, const ErbBands& bands)
     confAttack_  = static_cast<float> (std::exp (-1.0 / (1.0e-3 * base_.confidenceAttackMs  * framesPerSecond)));
     confRelease_ = static_cast<float> (std::exp (-1.0 / (1.0e-3 * base_.confidenceReleaseMs * framesPerSecond)));
 
+    calibrated_ = false;
+    observeOnly_ = false;
+    numPriors_ = 0;
     tones_.assign (kMaxTones, TrackedTone {});
     localFloor_.assign (static_cast<size_t> (numBins_), 0.0f);
     candidates_.assign (kMaxCandidates, Candidate {});
@@ -40,19 +43,62 @@ void HowlDetector::reset() noexcept
 void HowlDetector::setSensitivity (float s) noexcept
 {
     s = clampf (s, 0.0f, 1.0f);
+    sensitivity_ = s;
+    const HowlThresholds& base = calibrated_ ? calibrated_thr_ : base_;
     // Higher sensitivity lowers every ratio threshold and shortens the required
     // persistence. The span is deliberately modest: pushing the thresholds too
     // far down starts catching sustained vocal notes, which is the one failure
     // mode that would audibly damage a voice.
     const float shift = (0.5f - s) * 8.0f;              // +/- 4 dB
-    thr_.paprDb = base_.paprDb + shift;
-    thr_.pnprDb = base_.pnprDb + shift;
-    thr_.phprDb = base_.phprDb + shift;
+    thr_ = base;
+    thr_.paprDb = base.paprDb + shift;
+    thr_.pnprDb = base.pnprDb + shift;
+    thr_.phprDb = base.phprDb + shift;
     thr_.ipmpFrames = std::max (3, static_cast<int> (std::lround (
-                          static_cast<float> (base_.ipmpFrames) * (1.6f - 1.2f * s))));
-    thr_.imsdMax = base_.imsdMax * (0.6f + 0.9f * s);
-    thr_.fsdMaxHz = base_.fsdMaxHz * (0.5f + 1.2f * s);
-    thr_.fsdMaxFraction = base_.fsdMaxFraction * (0.5f + 1.2f * s);
+                          static_cast<float> (base.ipmpFrames) * (1.6f - 1.2f * s))));
+    thr_.imsdMax = base.imsdMax * (0.6f + 0.9f * s);
+    thr_.fsdMaxHz = base.fsdMaxHz * (0.5f + 1.2f * s);
+    thr_.fsdMaxFraction = base.fsdMaxFraction * (0.5f + 1.2f * s);
+}
+
+void HowlDetector::setCalibratedThresholds (float pnprDb, float phprDb, float fsdMaxHz,
+                                            float absoluteFloorDb,
+                                            float localProminenceDb) noexcept
+{
+    calibrated_thr_ = base_;
+    if (pnprDb > 0.0f)            calibrated_thr_.pnprDb = pnprDb;
+    if (phprDb > 0.0f)            calibrated_thr_.phprDb = phprDb;
+    if (fsdMaxHz > 0.0f)          calibrated_thr_.fsdMaxHz = fsdMaxHz;
+    if (absoluteFloorDb < 0.0f)   calibrated_thr_.absoluteFloorDb = absoluteFloorDb;
+    if (localProminenceDb > 0.0f) calibrated_thr_.localProminenceDb = localProminenceDb;
+    calibrated_ = true;
+
+    // Re-apply the sensitivity control on top of the new base.
+    const HowlThresholds savedBase = base_;
+    base_ = calibrated_thr_;
+    setSensitivity (sensitivity_);
+    base_ = savedBase;
+}
+
+void HowlDetector::clearCalibratedThresholds() noexcept
+{
+    calibrated_ = false;
+    setSensitivity (sensitivity_);
+}
+
+void HowlDetector::setModePriors (const float* freqsHz, int count) noexcept
+{
+    numPriors_ = std::min (count, kMaxPriors);
+    for (int i = 0; i < numPriors_; ++i)
+        priors_[i] = freqsHz[i];
+}
+
+bool HowlDetector::isNearPrior (float freqHz) const noexcept
+{
+    for (int i = 0; i < numPriors_; ++i)
+        if (std::abs (priors_[i] - freqHz) < 0.015f * freqHz)
+            return true;
+    return false;
 }
 
 int HowlDetector::findOrCreateSlot (float freqHz) noexcept
@@ -258,7 +304,8 @@ void HowlDetector::process (const float* magnitude) noexcept
     const float absoluteFloor = dbToGain (thr_.absoluteFloorDb);
     const float absoluteFloorPower = absoluteFloor * absoluteFloor
                                    * static_cast<float> (kFftSize) * 0.25f;
-    const float prominenceRatio = dbToGain (thr_.localProminenceDb) * dbToGain (thr_.localProminenceDb);
+    const float prominenceDb = observeOnly_ ? observeProminenceDb_ : thr_.localProminenceDb;
+    const float prominenceRatio = dbToGain (prominenceDb) * dbToGain (prominenceDb);
 
     int numCandidates = 0;
     for (int k = minBin_; k <= maxBin_ && numCandidates < kMaxCandidates; ++k)
@@ -339,6 +386,7 @@ void HowlDetector::process (const float* magnitude) noexcept
 
         t.bin = cand.bin;
         t.magnitude = magnitude[cand.bin];
+        t.localProminenceDb = 10.0f * std::log10 (cand.prominence + kEpsilon);
         t.framesSinceSeen = 0;
         t.persistence = std::min (t.persistence + 1, 100000);
 
@@ -368,10 +416,21 @@ void HowlDetector::process (const float* magnitude) noexcept
             continue;
         }
 
-        const bool papr = t.paprDb > thr_.paprDb;
-        const bool pnpr = t.pnprDb > thr_.pnprDb;
-        const bool phpr = t.phprDb > thr_.phprDb;
-        const bool ipmp = t.persistence >= thr_.ipmpFrames;
+        // A candidate on a known room mode needs less evidence: the persistence
+        // requirement drops and the ratio thresholds relax slightly. This is what
+        // the profiling phase buys - faster engagement where we already know the
+        // room rings, with no pre-emptive attenuation anywhere.
+        const bool onPrior = isNearPrior (t.freqHz);
+        const float priorRelaxDb = onPrior ? 3.0f : 0.0f;
+        const int   priorIpmp = onPrior
+                              ? std::max (3, static_cast<int> (std::lround (
+                                    static_cast<float> (thr_.ipmpFrames) * 0.4f)))
+                              : thr_.ipmpFrames;
+
+        const bool papr = t.paprDb > thr_.paprDb - priorRelaxDb;
+        const bool pnpr = t.pnprDb > thr_.pnprDb - priorRelaxDb;
+        const bool phpr = t.phprDb > thr_.phprDb - priorRelaxDb;
+        const bool ipmp = t.persistence >= priorIpmp;
         // IMSD only counts as evidence when the tone is actually building or
         // holding steady, not decaying.
         const bool imsd = t.slopeDeviation < thr_.imsdMax && t.slopeMeanDb > -0.5f;
@@ -381,7 +440,7 @@ void HowlDetector::process (const float* magnitude) noexcept
         const float fsdLimit = std::max (thr_.fsdMaxHz, thr_.fsdMaxFraction * t.freqHz);
         const bool fsd = t.freqDeviation < fsdLimit;
 
-        t.confirmed = papr && pnpr && phpr && ipmp && imsd && fsd;
+        t.confirmed = ! observeOnly_ && papr && pnpr && phpr && ipmp && imsd && fsd;
 
         const float target = t.confirmed ? 1.0f : 0.0f;
         const float c = target > t.confidence ? confAttack_ : confRelease_;

@@ -9,6 +9,7 @@ add_library(fbk_dsp STATIC
     HowlDetector.cpp
     TonalCanceller.cpp
     MaskFilter.cpp
+    Calibration.cpp
     FeedbackSuppressor.cpp
 )
 

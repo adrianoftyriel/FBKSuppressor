@@ -74,6 +74,8 @@ struct TrackedTone
     float slopeDeviation { 0.0f };  // IMSD
     float slopeMeanDb { 0.0f };
     float freqDeviation { 0.0f };   // FSD, Hz
+    float localProminenceDb { 0.0f }; // how far this peak stands above its
+                                      // spectral neighbourhood
 
     float confidence { 0.0f };    // 0..1, smoothed engage amount
     int   framesSinceSeen { 0 };
@@ -112,6 +114,35 @@ public:
 
     void setSensitivity (float s) noexcept;   // 0..1, 0.5 = nominal
 
+    // Thresholds measured from a calibration profile, replacing the defaults.
+    // Passing a non-positive value leaves that threshold at its default.
+    void setCalibratedThresholds (float pnprDb, float phprDb, float fsdMaxHz,
+                                  float absoluteFloorDb, float localProminenceDb) noexcept;
+    void clearCalibratedThresholds() noexcept;
+
+    // Known room resonances, from the profiling phase. A candidate landing on one
+    // of these needs less evidence before it is confirmed, because we already know
+    // this room rings there. Nothing is attenuated pre-emptively - this only
+    // changes how quickly the detector believes a tone that is genuinely present,
+    // which is the whole difference between this and ringing a room out.
+    void setModePriors (const float* freqsHz, int count) noexcept;
+    void clearModePriors() noexcept { numPriors_ = 0; }
+    int numModePriors() const noexcept { return numPriors_; }
+
+    // Observe-only: keep tracking and measuring criteria, but never confirm. Used
+    // while calibrating against a voice, so the plugin cannot act on the very
+    // signal it is measuring.
+    // Observe-only widens the peak-picking aperture as well as suppressing
+    // confirmation. At runtime the local-prominence gate is the first line of
+    // defence and it rejects most vocal harmonics outright - which is correct, but
+    // it also means a calibration pass would see nothing at all to measure. In
+    // observe mode the gate drops to observeProminenceDb so the tracker admits the
+    // wider population of peaks a voice actually produces, and the criteria get
+    // computed for them through exactly the same code path.
+    void setObserveOnly (bool o) noexcept { observeOnly_ = o; }
+    bool isObserveOnly() const noexcept { return observeOnly_; }
+    void setObserveProminenceDb (float db) noexcept { observeProminenceDb_ = db; }
+
     // Call once per analysis frame.
     void process (const float* magnitude) noexcept;
 
@@ -133,12 +164,24 @@ private:
 
     HowlThresholds thr_ {};
     HowlThresholds base_ {};
+    float sensitivity_ { 0.5f };
     float confAttack_ { 0.0f }, confRelease_ { 0.0f };
     float binWidthHz_ { 1.0f };
     float freqMatchHz_ { 30.0f };
 
+    bool isNearPrior (float freqHz) const noexcept;
+
     std::vector<TrackedTone> tones_;
     std::vector<float> localFloor_;
+
+    // Calibration state.
+    bool  observeOnly_ { false };
+    float observeProminenceDb_ { 3.0f };
+    bool  calibrated_ { false };
+    HowlThresholds calibrated_thr_ {};
+    static constexpr int kMaxPriors = 32;
+    float priors_[kMaxPriors] {};
+    int   numPriors_ { 0 };
     int numConfirmed_ { 0 };
 
     // Candidate scratch, sized once so the per-frame work allocates nothing.

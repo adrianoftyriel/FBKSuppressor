@@ -7,6 +7,7 @@
 #include "SignalUtils.h"
 
 #include "Analyser.h"
+#include "Calibration.h"
 #include "ErbBands.h"
 #include "FeedbackSuppressor.h"
 #include "Fft.h"
@@ -777,6 +778,294 @@ void testSustainedNoteNotTreatedAsFeedback()
     CHECK_LT (std::abs (db), 1.5);
 }
 // ===========================================================================
+void testHistogramPercentiles()
+{
+    beginTest ("Histogram percentiles");
+
+    Histogram h;
+    h.prepare (0.0f, 100.0f);
+
+    // Uniform 0..99: the median should land near 50 and the extremes near the ends.
+    for (int i = 0; i < 100; ++i)
+        h.add (static_cast<float> (i));
+
+    CHECK (h.count() == 100);
+    CHECK_CLOSE (static_cast<double> (h.percentile (0.50f)), 50.0, 2.0);
+    CHECK_CLOSE (static_cast<double> (h.percentile (0.05f)), 5.0, 2.0);
+    CHECK_CLOSE (static_cast<double> (h.percentile (0.95f)), 95.0, 2.0);
+    CHECK_CLOSE (static_cast<double> (h.mean()), 49.5, 1.0);
+
+    // Values outside the range are counted, so a percentile in the overflow
+    // returns the range limit rather than silently reporting an in-range value.
+    Histogram h2;
+    h2.prepare (0.0f, 10.0f);
+    for (int i = 0; i < 50; ++i)
+        h2.add (-5.0f);
+    for (int i = 0; i < 50; ++i)
+        h2.add (500.0f);
+    CHECK (h2.count() == 100);
+    CHECK_CLOSE (static_cast<double> (h2.percentile (0.10f)), 0.0, 0.01);
+    CHECK_CLOSE (static_cast<double> (h2.percentile (0.90f)), 10.0, 0.01);
+}
+
+// ===========================================================================
+// Runs the voice calibration phase on a synthetic voice and returns the profile.
+VoiceProfile calibrateOnVoice (FeedbackSuppressor& fs, double sr, double seconds, double f0)
+{
+    SyntheticVoice voice (sr, f0);
+    Rng rng (41);
+    const int n = static_cast<int> (sr * seconds);
+    std::vector<float> block (256);
+
+    fs.beginCalibration (CalibrationPhase::voice);
+    int written = 0;
+    while (written < n)
+    {
+        for (auto& v : block)
+            v = voice.next() + 0.0015f * rng.gaussian();
+        fs.processBlock (block.data(), static_cast<int> (block.size()));
+        written += static_cast<int> (block.size());
+    }
+    fs.finishCalibration();
+    return fs.profile();
+}
+
+void testCalibrationMeasuresTheVoice()
+{
+    beginTest ("Calibration measures the voice it will be judged against");
+
+    const double sr = 48000.0;
+    FeedbackSuppressor fs;
+    fs.prepare (sr, 256);
+    fs.setParameters (defaultParams());
+
+    const auto p = calibrateOnVoice (fs, sr, 20.0, 130.0);
+
+    CHECK (p.hasVoice);
+    CHECK (p.valid);
+    CHECK (p.hasSuggestions);
+    info ("criterion samples collected = %.0f", static_cast<double> (p.voiceCriterionSamples));
+    CHECK_GT (p.voiceCriterionSamples, 200);
+
+    // f0 should land near the synthetic fundamental. The generator applies a
+    // +/-12% contour, so allow for that rather than demanding an exact match.
+    info2 ("f0 low %.0f Hz, high %.0f Hz",
+           static_cast<double> (p.f0LowHz), static_cast<double> (p.f0HighHz));
+    info ("f0 median = %.0f Hz", static_cast<double> (p.f0MedianHz));
+    CHECK_GT (p.f0MedianHz, 100.0f);
+    CHECK_LT (p.f0MedianHz, 170.0f);
+
+    info2 ("voice PNPR p95 = %.1f dB -> suggested threshold %.1f dB",
+           static_cast<double> (p.voicePnprP95Db), static_cast<double> (p.suggestedPnprDb));
+    info2 ("voice prominence median %.1f dB, p95 %.1f dB",
+           static_cast<double> (p.voiceProminenceMedianDb),
+           static_cast<double> (p.voiceProminenceP95Db));
+    info ("suggested prominence gate = %.1f dB", static_cast<double> (p.suggestedLocalProminenceDb));
+    info2 ("voice FSD p05 = %.2f Hz, median %.2f Hz",
+           static_cast<double> (p.voiceFsdP05Hz), static_cast<double> (p.voiceFsdMedianHz));
+    info ("suggested FSD threshold = %.2f Hz", static_cast<double> (p.suggestedFsdMaxHz));
+
+    // The whole point: each suggested threshold must sit outside what this voice
+    // actually does. PNPR above the voice's 95th percentile, so a tone has to be
+    // more isolated than almost anything the voice produced.
+    CHECK_GT (p.suggestedPnprDb, p.voicePnprP95Db);
+
+    // FSD is the reverse - feedback is steadier than a voice - so the threshold
+    // goes below the voice's typical wander. Asserted against the median rather
+    // than the 5th percentile because the suggestion is clamped to a sane range,
+    // and a clamp hit would otherwise read as a failure when the behaviour is
+    // correct.
+    CHECK_GT (p.voiceFsdMedianHz, 0.0f);
+    CHECK_LT (p.suggestedFsdMaxHz, p.voiceFsdMedianHz);
+    CHECK (p.suggestedFsdMaxHz >= 0.4f && p.suggestedFsdMaxHz <= 8.0f);
+
+    // The prominence gate must end up above what the voice produces.
+    CHECK_GT (p.suggestedLocalProminenceDb, p.voiceProminenceMedianDb);
+    CHECK (p.suggestedLocalProminenceDb >= 8.0f && p.suggestedLocalProminenceDb <= 20.0f);
+
+    // Per-band protection must be strongest where the voice actually lives.
+    int loudest = 0, quietest = 0;
+    for (int b = 1; b < kNumBands; ++b)
+    {
+        if (p.bandVoiceDb[b] > p.bandVoiceDb[loudest]) loudest = b;
+        if (p.bandVoiceDb[b] < p.bandVoiceDb[quietest]) quietest = b;
+    }
+    info2 ("protection: loudest band %.2f, quietest band %.2f",
+           static_cast<double> (p.suggestedVoiceProtection[loudest]),
+           static_cast<double> (p.suggestedVoiceProtection[quietest]));
+    CHECK_GT (p.suggestedVoiceProtection[loudest], p.suggestedVoiceProtection[quietest]);
+}
+
+// ===========================================================================
+void testObserveOnlyDoesNotProcess()
+{
+    beginTest ("Voice calibration never acts on the signal it is measuring");
+
+    const double sr = 48000.0;
+    FeedbackSuppressor fs;
+    fs.prepare (sr, 256);
+    auto params = defaultParams();
+    params.denoiseEnabled = false;
+    params.humEnabled = false;
+    params.highPassEnabled = false;
+    fs.setParameters (params);
+
+    // A dead-steady tone - exactly what the detector would normally pounce on.
+    const double toneHz = 1500.0;
+    const int n = static_cast<int> (sr * 4.0);
+    std::vector<float> sig (static_cast<size_t> (n));
+    double phase = 0.0;
+    for (int i = 0; i < n; ++i)
+    {
+        phase += 2.0 * fbk::kPi * toneHz / sr;
+        sig[static_cast<size_t> (i)] = static_cast<float> (0.3 * std::sin (phase));
+    }
+
+    fs.beginCalibration (CalibrationPhase::voice);
+    auto out = run (fs, sig, 128);
+    fs.finishCalibration();
+
+    const int mStart = n - static_cast<int> (sr);
+    const int mLen = static_cast<int> (sr);
+    const double atten = toDb (goertzelMagnitude (out.data() + mStart, mLen, toneHz, sr))
+                       - toDb (goertzelMagnitude (sig.data() + mStart, mLen, toneHz, sr));
+    info ("tone attenuation during voice calibration = %.2f dB", atten);
+
+    // Nothing may be cancelled while characterising a voice, or the measurement
+    // would be of the processed signal rather than the real one.
+    CHECK_LT (std::abs (atten), 0.5);
+}
+
+// ===========================================================================
+void testProfileKeepsVoiceSafeAndTonesCaught()
+{
+    beginTest ("Applying a profile keeps the voice safe and still catches tones");
+
+    const double sr = 48000.0;
+
+    FeedbackSuppressor fs;
+    fs.prepare (sr, 256);
+    auto params = defaultParams();
+    params.humEnabled = false;
+    params.highPassEnabled = false;
+    fs.setParameters (params);
+
+    const auto p = calibrateOnVoice (fs, sr, 20.0, 150.0);
+    CHECK (p.hasVoice);
+
+    fs.applyProfile (p);
+    CHECK (fs.hasProfileApplied());
+
+    // A held note must still not be confirmed with calibrated thresholds - if
+    // calibration made the detector trigger-happy, this is where it shows.
+    {
+        const int n = static_cast<int> (sr * 5.0);
+        SyntheticVoice held (sr, 220.0);
+        std::vector<float> sig (static_cast<size_t> (n));
+        for (int i = 0; i < n; ++i)
+            sig[static_cast<size_t> (i)] = 2.5f * held.next();
+
+        const auto out = run (fs, sig, 128);
+        const int mStart = n - static_cast<int> (sr * 2.0);
+        const int mLen = static_cast<int> (sr * 2.0);
+        const double db = toDb (rms (out.data() + mStart, mLen))
+                        - toDb (rms (sig.data() + mStart, mLen));
+        info ("held note with profile applied = %+.2f dB", db);
+        CHECK_LT (std::abs (db), 1.5);
+    }
+
+    // And a real feedback tone must still be cancelled hard.
+    {
+        fs.reset();
+        const double toneHz = 2890.0;
+        const int n = static_cast<int> (sr * 5.0);
+        Rng rng (17);
+        std::vector<float> sig (static_cast<size_t> (n));
+        double phase = 0.0;
+        for (int i = 0; i < n; ++i)
+        {
+            phase += 2.0 * fbk::kPi * toneHz / sr;
+            const double t = static_cast<double> (i) / sr;
+            const double ramp = std::min (1.0, t / 1.0);
+            sig[static_cast<size_t> (i)] =
+                static_cast<float> (0.3 * ramp * std::sin (phase)) + 0.002f * rng.gaussian();
+        }
+
+        const auto out = run (fs, sig, 128);
+        const int mStart = n - static_cast<int> (sr);
+        const int mLen = static_cast<int> (sr);
+        const double atten = toDb (goertzelMagnitude (out.data() + mStart, mLen, toneHz, sr))
+                           - toDb (goertzelMagnitude (sig.data() + mStart, mLen, toneHz, sr));
+        info ("tone attenuation with profile applied = %.1f dB", atten);
+        CHECK_LT (atten, -20.0);
+    }
+}
+
+// ===========================================================================
+void testModePriorsSpeedUpEngagement()
+{
+    beginTest ("Room-mode priors make engagement measurably faster");
+
+    const double sr = 48000.0;
+    const double toneHz = 1830.0;
+
+    // How much tone energy leaks through in the first second, with and without a
+    // prior at that frequency. Faster engagement means less leaked energy - an
+    // end-to-end measurement rather than an internal counter.
+    const auto leakedEnergy = [&] (bool withPrior) -> double
+    {
+        FeedbackSuppressor fs;
+        fs.prepare (sr, 256);
+        auto params = defaultParams();
+        params.denoiseEnabled = false;
+        params.humEnabled = false;
+        params.highPassEnabled = false;
+        fs.setParameters (params);
+
+        if (withPrior)
+        {
+            VoiceProfile p;
+            p.valid = true;
+            p.numModes = 1;
+            p.modes[0].freqHz = toneHz;
+            p.modes[0].strengthDb = 30.0f;
+            p.modes[0].engagedSeconds = 10.0f;
+            p.modes[0].hits = 20;
+            fs.applyProfile (p);
+        }
+
+        // Tone switches on abruptly at t = 0.25 s over a light noise floor.
+        const int n = static_cast<int> (sr * 1.5);
+        Rng rng (61);
+        std::vector<float> sig (static_cast<size_t> (n));
+        double phase = 0.0;
+        const int onset = static_cast<int> (sr * 0.25);
+        for (int i = 0; i < n; ++i)
+        {
+            phase += 2.0 * fbk::kPi * toneHz / sr;
+            const float tone = i >= onset ? static_cast<float> (0.3 * std::sin (phase)) : 0.0f;
+            sig[static_cast<size_t> (i)] = tone + 0.002f * rng.gaussian();
+        }
+
+        const auto out = run (fs, sig, 64);
+
+        double energy = 0.0;
+        for (int i = onset; i < n; ++i)
+            energy += static_cast<double> (out[static_cast<size_t> (i)]) * out[static_cast<size_t> (i)];
+        return energy;
+    };
+
+    const double without = leakedEnergy (false);
+    const double with = leakedEnergy (true);
+
+    info2 ("leaked tone energy: no prior %.4f, with prior %.4f", without, with);
+    info ("reduction = %.1f%%", 100.0 * (without - with) / std::max (without, 1e-12));
+
+    // The prior must help, and must not somehow make things worse.
+    CHECK_LT (with, without);
+}
+
+// ===========================================================================
 void testNoAllocationOnAudioThread()
 {
     beginTest ("No allocation in the audio path");
@@ -953,6 +1242,11 @@ int main()
     testNumericalRobustness();
     testBlockSizeInvariance();
     testSustainedNoteNotTreatedAsFeedback();
+    testHistogramPercentiles();
+    testCalibrationMeasuresTheVoice();
+    testObserveOnlyDoesNotProcess();
+    testProfileKeepsVoiceSafeAndTonesCaught();
+    testModePriorsSpeedUpEngagement();
     testNoAllocationOnAudioThread();
     testPhaseModeSwitchIsClean();
     testRealTimeFactor();
