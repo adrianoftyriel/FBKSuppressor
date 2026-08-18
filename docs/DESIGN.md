@@ -165,7 +165,7 @@ Because the canceller's adaptation rate scales with detection confidence, even a
 false positive that did slip through could only act slowly and narrowly before
 the detector dropped it.
 
-## 6. Six bugs the tests found
+## 6. Seven bugs the tests and CI found
 
 Worth recording, because each was a design error rather than a typo, and none
 would have been obvious by reading the code.
@@ -218,6 +218,21 @@ failed on macOS having passed on Linux. Replaced with a plain constant in
 `Common.h`. Two consequences: the CI now runs the DSP tests under both GCC and
 Clang as a fast gate, and it runs them natively on all three platforms rather than
 trusting Linux to speak for the others.
+
+**`std::aligned_alloc` does not exist in MSVC.** The allocation-tracking test
+overrides the aligned `operator new`, and reached for `std::aligned_alloc` — which
+is in libstdc++ and in libc++, but not in MSVC, which never implemented C11's
+`aligned_alloc`. It provides `_aligned_malloc`, whose memory must be released with
+`_aligned_free` rather than `free`. The aligned `operator delete` overloads are
+only ever called for aligned allocations, so pairing them separately from the
+plain ones is correct.
+
+Two standard-library portability bugs in a row, both invisible to a Linux build,
+so the fast CI gate now compiles and runs the DSP suite under **all four**
+toolchains — Linux GCC, Linux Clang, MSVC and Apple Clang. Each takes about a
+minute because the core has no JUCE dependency, as against four-plus minutes to
+reach the same compile error inside a plugin build that must configure JUCE first.
+The general lesson: "the tests pass" means nothing until you name the toolchain.
 
 **Hum probes built on LMS weights measured the wrong thing.** Deciding between
 50 and 60 Hz cannot be done from the analysis FFT — at 23 Hz bin spacing,

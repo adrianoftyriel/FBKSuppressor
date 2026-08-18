@@ -19,6 +19,10 @@
 #include <memory>
 #include <new>
 
+#ifdef _MSC_VER
+ #include <malloc.h>
+#endif
+
 // ---------------------------------------------------------------------------
 // Allocation tracking, so real-time safety is verified rather than asserted.
 //
@@ -52,12 +56,39 @@ void* operator new (std::size_t n)
 
 void* operator new[] (std::size_t n) { return ::operator new (n); }
 
+// Aligned allocation is the one place where the three platforms genuinely differ.
+// MSVC never implemented C11 aligned_alloc, so std::aligned_alloc does not exist
+// there; it provides _aligned_malloc instead, and memory from it must be released
+// with _aligned_free rather than free. The aligned operator delete overloads below
+// are only ever called for aligned allocations, so the pairing stays correct.
+namespace rtcheck
+{
+inline void* alignedAlloc (std::size_t bytes, std::size_t align)
+{
+   #ifdef _MSC_VER
+    return _aligned_malloc (bytes, align);
+   #else
+    // std::aligned_alloc requires the size to be a multiple of the alignment.
+    const std::size_t rounded = ((bytes + align - 1) / align) * align;
+    return std::aligned_alloc (align, rounded ? rounded : align);
+   #endif
+}
+
+inline void alignedFree (void* p) noexcept
+{
+   #ifdef _MSC_VER
+    _aligned_free (p);
+   #else
+    std::free (p);
+   #endif
+}
+} // namespace rtcheck
+
 void* operator new (std::size_t n, std::align_val_t a)
 {
     noteAllocation();
     const std::size_t align = static_cast<std::size_t> (a);
-    const std::size_t size = ((n + align - 1) / align) * align;
-    if (void* p = std::aligned_alloc (align, size ? size : align))
+    if (void* p = rtcheck::alignedAlloc (n ? n : align, align))
         return p;
     throw std::bad_alloc();
 }
@@ -68,10 +99,10 @@ void operator delete (void* p) noexcept { std::free (p); }
 void operator delete[] (void* p) noexcept { std::free (p); }
 void operator delete (void* p, std::size_t) noexcept { std::free (p); }
 void operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
-void operator delete (void* p, std::align_val_t) noexcept { std::free (p); }
-void operator delete[] (void* p, std::align_val_t) noexcept { std::free (p); }
-void operator delete (void* p, std::size_t, std::align_val_t) noexcept { std::free (p); }
-void operator delete[] (void* p, std::size_t, std::align_val_t) noexcept { std::free (p); }
+void operator delete (void* p, std::align_val_t) noexcept { rtcheck::alignedFree (p); }
+void operator delete[] (void* p, std::align_val_t) noexcept { rtcheck::alignedFree (p); }
+void operator delete (void* p, std::size_t, std::align_val_t) noexcept { rtcheck::alignedFree (p); }
+void operator delete[] (void* p, std::size_t, std::align_val_t) noexcept { rtcheck::alignedFree (p); }
 
 using namespace fbk;
 using namespace test;
@@ -134,7 +165,8 @@ void testFft()
     // A pure bin should land in exactly that bin.
     const int bin = 37;
     for (int i = 0; i < n; ++i)
-        in[static_cast<size_t> (i)] = std::cos (2.0 * fbk::kPi * bin * i / n);
+        in[static_cast<size_t> (i)] = static_cast<float> (
+            std::cos (2.0 * fbk::kPi * static_cast<double> (bin) * i / n));
     fft.forwardReal (in.data(), spec.data());
 
     int peak = 0;

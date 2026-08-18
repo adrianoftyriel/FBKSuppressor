@@ -22,45 +22,76 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Two compilers, because they disagree about more than they should. A C++20
-  # library header present in libstdc++ and absent from the macOS runner's libc++
-  # broke the build there while Linux/GCC was perfectly happy; running GCC and
-  # Clang here catches that class of problem in seconds instead of five minutes
-  # into a plugin build.
+  # Every platform's standard library, as a fast gate.
+  #
+  # This exists because two portability bugs in a row got through a Linux-only
+  # check: <numbers> is in libstdc++ but not in the macOS runner's libc++, and
+  # std::aligned_alloc is in both but not in MSVC, which never implemented C11's
+  # aligned_alloc. Both are compile errors that a Linux build cannot see.
+  #
+  # The DSP core has no JUCE dependency, so each of these configures, compiles and
+  # runs the whole suite in about a minute - as against four-plus minutes to reach
+  # the same compile error inside a plugin build that first has to configure JUCE.
+  # Catching a standard-library disagreement is worth four cheap jobs.
   dsp-tests:
-    name: DSP tests (${{ matrix.compiler }})
-    runs-on: ubuntu-latest
+    name: DSP tests (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - compiler: gcc
-            cxx: g++
-          - compiler: clang
-            cxx: clang++
+          - name: Linux / GCC
+            os: ubuntu-latest
+            cmake_extra: -DCMAKE_CXX_COMPILER=g++
+          - name: Linux / Clang
+            os: ubuntu-latest
+            cmake_extra: -DCMAKE_CXX_COMPILER=clang++
+          - name: Windows / MSVC
+            os: windows-latest
+            cmake_extra: ""
+          - name: macOS / Apple Clang
+            os: macos-latest
+            cmake_extra: ""
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build clang
+      - name: Install toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build clang
 
-      # The core DSP has no JUCE dependency, so this configures and runs in
-      # seconds without fetching a plugin framework.
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Install Ninja (Windows)
+        if: runner.os == 'Windows'
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Configure
+        shell: bash
         run: >
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
-          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
           -DFBK_BUILD_PLUGIN=OFF
           -DFBK_BUILD_TESTS=ON
+          ${{ matrix.cmake_extra }}
 
       - name: Build
+        shell: bash
         run: cmake --build build --parallel
 
       - name: Run tests
-        run: ./build/tests/fbk_tests
+        shell: bash
+        run: |
+          if [ -f build/tests/fbk_tests.exe ]; then
+            ./build/tests/fbk_tests.exe
+          else
+            ./build/tests/fbk_tests
+          fi
 
   # ---------------------------------------------------------------------------
   build:

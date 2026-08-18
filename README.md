@@ -62,8 +62,8 @@ it; it is off by default and the host compensates it when on.
 
 ## Measured performance
 
-From the test suite (`./build/tests/fbk_tests`, 54 checks, all passing under both
-GCC and Clang):
+From the test suite (`./build/tests/fbk_tests`, 54 checks, all passing under
+Linux GCC, Linux Clang, MSVC and Apple Clang):
 
 | Measurement | Result |
 |---|---|
