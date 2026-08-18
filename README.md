@@ -136,6 +136,27 @@ xattr -dr com.apple.quarantine /Library/Audio/Plug-Ins/Components/FBKSuppressor.
 **Standalone** — run the binary directly. This gives the lowest achievable round
 trip, because there is no host buffering in the path at all.
 
+### Standalone driver backends
+
+The standalone is the only build that talks to a driver itself — a plugin inherits
+whatever the host is using — so the low-latency backends matter here and nowhere
+else. Both are enabled explicitly, because JUCE has them **off by default**:
+
+| Platform | Backends offered |
+|---|---|
+| Windows | **ASIO**, plus WASAPI (shared, low-latency shared, and exclusive) and DirectSound |
+| macOS | CoreAudio |
+| Linux | **JACK**, plus ALSA |
+
+Use ASIO on Windows if you have any interface at all — WASAPI exclusive is the
+fallback and can manage a few milliseconds, but it will not reach the 16–64 sample
+buffers this plugin is designed around.
+
+ASIO appears as a device *type* even when no ASIO driver is installed, in which
+case its device list is empty. That means no driver, not a broken build — install
+your interface's driver, or ASIO4ALL as a generic fallback (a real interface driver
+will always do better).
+
 ---
 
 ## Controls

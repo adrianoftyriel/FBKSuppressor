@@ -458,7 +458,31 @@ And the changelog uses `git log -n 60` rather than piping into `head -60`: under
 status 141, and the step fails - but only once the changelog exceeds sixty commits,
 which is to say only on a release big enough to care about.
 
-## 16. v0.3: sidechain AFC
+## 16. Standalone driver backends
+
+Worth recording as a plain oversight rather than a subtlety. JUCE defaults
+`JUCE_ASIO` to 0 and `JUCE_JACK` to 0, and I shipped without setting either. The
+standalone therefore offered only WASAPI and DirectSound on Windows, which cannot
+reach the 16-64 sample buffers the entire design is built around - so the one build
+that exists specifically to give the lowest round trip was the one build that
+couldn't.
+
+It cost nothing to fix. From JUCE 8 the ASIO headers are bundled
+(`juce_audio_devices/native/asio`), with `JUCE_ASIO_USE_EXTERNAL_SDK` defaulting to
+0, so no Steinberg SDK download or CI secret is needed - only the flag. The binary
+is still subject to the ASIO SDK licence terms.
+
+WASAPI needed no flag: it is on by default and already exposes exclusive and
+low-latency shared modes as distinct device types at runtime. That is the fallback
+when no ASIO driver is present.
+
+The general lesson is about where a default bites. Nothing in the test suite or in
+pluginval could have caught this, because neither exercises device enumeration - the
+tests drive the DSP directly and pluginval hosts the plugin itself. It only surfaces
+when a human opens the standalone's audio settings and looks at the list. Some
+things genuinely require someone to run the program.
+
+## 17. v0.3: sidechain AFC
 
 With the loudspeaker signal available as a reference, the feedback path itself can
 be estimated and subtracted, which removes *zero* voice energy rather than very
