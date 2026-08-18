@@ -292,8 +292,15 @@ jobs:
   publish:
     name: Publish ${{ github.ref_name == 'main' && 'release' || 'pre-release' }}
     needs: [build, validate]
+    # workflow_dispatch is allowed as well as push, purely as a recovery path.
+    # Publishing depends on the validate jobs, and a run can stall between those
+    # finishing and the dependent job being scheduled - which happened once, leaving
+    # ten green jobs, no publish job, and a run wedged in_progress with no way to
+    # finish it. Gated on push alone there was no way to publish that commit short of
+    # inventing a new one. Manual dispatch on dev or main now does the same thing,
+    # which also makes it possible to cut a release on demand.
     if: >-
-      github.event_name == 'push'
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
       && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
     runs-on: ubuntu-latest
     permissions:

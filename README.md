@@ -111,6 +111,17 @@ step fails with a message rather than overwriting binaries you may already have
 downloaded. So the flow for a real release is bump the version in `CMakeLists.txt`,
 merge to `dev`, check the pre-release, then merge to `main`.
 
+Publishing can also be triggered manually: **Actions → Build → Run workflow**, on
+`dev` or `main`. That exists as a recovery path — the publish step depends on the
+validation jobs, and a run can occasionally stall between those finishing and the
+dependent job being scheduled, leaving every job green but nothing published. Gated
+on pushes alone there was no way to publish that commit without inventing a new one.
+It also means you can cut a release on demand.
+
+If a run ever ends with all jobs green and no release, that is what happened, and
+either a manual dispatch or "Re-run all jobs" will finish it. The build artifacts are
+downloadable from the run itself in the meantime — that separation is deliberate.
+
 Note that pre-releases accumulate — one per push to `dev`. Nothing prunes them
 automatically, because deleting releases is not something I'll do unasked; say the
 word if you want old ones cleaned up on a rolling basis.
