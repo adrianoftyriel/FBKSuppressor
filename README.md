@@ -172,6 +172,16 @@ will always do better).
 
 ## Controls
 
+The window is laid out like a channel strip, because that is what your hands
+already know. Across the top: identity, bypass, quality mode, the latency
+readout and a running status line, then the three tabs. Below that the analyser
+takes a third of the height, and the bottom half is five module strips —
+Feedback, Noise, Hum, Dereverb, Rumble — each with an illuminated switch, a live
+readout, and one vertical fader per parameter. **Strength** is the tall fader
+down the right-hand side, running from the top of the analyser to the bottom of
+the window. It sits outside the tabs on purpose: the master control has to be
+under your hand whichever tab happens to be open.
+
 | Control | Default | Notes |
 |---|---|---|
 | **Strength** | 100% | Overall dry/wet. At 0% the output is bit-identical to the input. |
