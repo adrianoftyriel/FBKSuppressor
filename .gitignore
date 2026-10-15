@@ -9,3 +9,6 @@ cmake-build-*/
 Builds/
 JuceLibraryCode/
 dist/
+__pycache__/
+*.pyc
+*.fbkm

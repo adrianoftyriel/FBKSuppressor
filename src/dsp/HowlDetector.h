@@ -129,6 +129,20 @@ public:
     void clearModePriors() noexcept { numPriors_ = 0; }
     int numModePriors() const noexcept { return numPriors_; }
 
+    // Per-band feedback probability from a learned separator, [0,1], kNumBands
+    // values (copied; nullptr clears). Works like a mode prior, but is available
+    // for every band and every frame rather than only at profiled frequencies:
+    // where the model is confident, a candidate needs up to 3 dB less ratio
+    // evidence and 60% less persistence before it is believed.
+    //
+    // It is deliberately one-directional and bounded. It never touches the IMSD or
+    // FSD criteria, so a tone that is moving - a voice - cannot be confirmed no
+    // matter what the model says, and it only acts on a peak that has already
+    // cleared the local-prominence gate. A confidently wrong model can therefore
+    // make a real howl engage sooner or a borderline one engage a little sooner;
+    // it cannot make a held sung note a feedback tone.
+    void setLearnedPrior (const float* feedbackProbPerBand) noexcept;
+
     // Observe-only: keep tracking and measuring criteria, but never confirm. Used
     // while calibrating against a voice, so the plugin cannot act on the very
     // signal it is measuring.
@@ -182,6 +196,8 @@ private:
     static constexpr int kMaxPriors = 32;
     float priors_[kMaxPriors] {};
     int   numPriors_ { 0 };
+    float learnedPrior_[kNumBands] {};
+    bool  learnedActive_ { false };
     int numConfirmed_ { 0 };
 
     // Candidate scratch, sized once so the per-frame work allocates nothing.

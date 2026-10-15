@@ -16,11 +16,16 @@ There is no ringing out, no static EQ, no notch filters, no gates, no thresholds
 
 ## Status
 
-**v0.1 — signal processing only.** Everything here is deterministic DSP with no
-trained parameters, which means it behaves predictably on material no model has
-ever seen. The learned voice/non-voice separator is v0.2; the interface for it is
-already in the code (`SpectralSeparator`), and adding it will be a substitution
-rather than a rewrite.
+**v0.1 — signal processing only, shipping.** Everything the plugin does today is
+deterministic DSP with no trained parameters, which means it behaves predictably on
+material no model has ever seen.
+
+**v0.2 — learned separator, engine built, no weights yet.** The inference engine
+(`NeuralSeparator`), its model format, the wiring into the mask and the howl
+detector, and a training and export kit (`training/`) are in the tree and tested.
+There is no trained model in the repository, so the plugin still runs on the
+heuristic speech-presence estimate until one is trained and loaded. See
+`training/README.md`. What is verified and what is not is stated there.
 
 ---
 

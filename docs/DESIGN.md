@@ -493,3 +493,50 @@ a stability detector. That is the intended implementation, with the existing bli
 tonal canceller as the fallback whenever no reference is connected.
 
 The bus is declared and disabled in `PluginProcessor.cpp`. Nothing reads it yet.
+
+---
+
+## 11. The learned separator (v0.2)
+
+**What the network is for.** Not audio. It never produces output samples, so the
+zero-latency guarantee is a property of the architecture and no model can break it.
+It reads the 32 ERB band energies and reports, per band, voice presence and
+feedback probability, plus a broadband voice activity. Presence replaces the
+heuristic `speechPresence()` in the mask; feedback probability is a prior for the
+detector.
+
+**Two heads, not one.** Voice presence and feedback probability are independent
+outputs rather than complements. A band can be neither (steady noise), and a held
+sung note should be voice with no feedback although it is tonal. Folding both into
+one "voice vs. not" output would force the model to call every steady tone either
+voice or noise, which is the exact confusion the detector's FSD criterion exists to
+resolve.
+
+**The prior is one-directional and bounded.** `HowlDetector::setLearnedPrior`
+relaxes the ratio criteria by up to 3 dB and the persistence requirement by up to
+60%, the same as a profiled room mode and not more (the two take the stronger,
+they do not stack). It never relaxes IMSD or FSD, and only acts on a peak that has
+already cleared the local-prominence gate. The consequence, tested against
+arbitrary large-weight models, is that a model that is confidently wrong cannot
+make the canceller engage on a moving voice. It can only make a real or borderline
+tone engage sooner.
+
+**Conditioning on the controls (FiLM).** The four user-facing controls are an input
+to the network, modulating the hidden layer as `(1 + gamma) * x + beta`, so one
+model serves every setting rather than needing one per setting.
+
+**A learned smoother.** An optional GRU over the network's own outputs adds a
+residual to the logits. It replaces the idea of hand-tuning attack and release on
+the model's output; the detector's own confidence attack and release still apply
+downstream.
+
+**Why hand-written inference.** The topology is fixed and small, so the engine is a
+few hundred lines with no dependency. That keeps the DSP core buildable on all four
+CI toolchains with nothing fetched, lets the tests replace `operator new` and prove
+zero allocation with a model attached, and lets an independent reference
+implementation check the arithmetic to ~1e-7.
+
+**Honest limits.** There are no trained weights; the engine and its safety
+properties are verified, the model's usefulness is not, because it does not exist
+yet. The plugin has no UI for loading a model. Feature extraction for training must
+match `ErbBands`; a C++ band-energy dump tool to guarantee that is not written.

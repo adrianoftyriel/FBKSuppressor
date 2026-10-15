@@ -14,6 +14,8 @@
 // reacts or an air handler cycles.
 #pragma once
 
+#include <array>
+
 #include "Common.h"
 #include "ErbBands.h"
 
@@ -34,11 +36,30 @@ public:
     // Per-band a-posteriori SNR, linear.
     const float* bandSnr() const noexcept { return bandSnr_.data(); }        // kNumBands
 
-    // Probability-like speech presence in [0,1], per band.
-    const float* speechPresence() const noexcept { return presence_.data(); }// kNumBands
+    // Probability-like speech presence in [0,1], per band. While a learned
+    // separator is supplying presence it replaces the heuristic estimate; the
+    // heuristic keeps running underneath so detaching the model is seamless.
+    const float* speechPresence() const noexcept
+    {
+        return externalActive_ ? external_.data() : presence_.data();   // kNumBands
+    }
 
     // Broadband speech presence in [0,1].
-    float overallSpeechPresence() const noexcept { return overallPresence_; }
+    float overallSpeechPresence() const noexcept
+    {
+        return externalActive_ ? externalVad_ : overallPresence_;
+    }
+
+    // Supply presence from a learned separator (kNumBands values and a broadband
+    // activity), or pass nullptr to fall back to the heuristic.
+    void setExternalPresence (const float* perBand, float voiceActivity) noexcept
+    {
+        externalActive_ = (perBand != nullptr);
+        externalVad_ = voiceActivity;
+        if (perBand != nullptr)
+            for (int b = 0; b < kNumBands; ++b)
+                external_[static_cast<size_t> (b)] = clampf (perBand[b], 0.0f, 1.0f);
+    }
 
 private:
     const ErbBands* bands_ { nullptr };
@@ -55,5 +76,9 @@ private:
     std::vector<float> bandNoise_, bandPower_, bandSnr_, presence_;
     float overallPresence_ { 0.0f };
     bool  primed_ { false };
+
+    std::array<float, kNumBands> external_ {};
+    float externalVad_ { 0.0f };
+    bool  externalActive_ { false };
 };
 } // namespace fbk

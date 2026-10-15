@@ -6,6 +6,7 @@ add_library(fbk_dsp STATIC
     ErbBands.cpp
     Analyser.cpp
     NoiseTracker.cpp
+    NeuralSeparator.cpp
     HowlDetector.cpp
     TonalCanceller.cpp
     MaskFilter.cpp

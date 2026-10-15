@@ -182,7 +182,8 @@ private:
     CaptureRing    capture_;
 
     SpectralSeparator* separator_ { nullptr };
-    std::vector<float> bandEnergy_, separatorPresence_;
+    std::vector<float> bandEnergy_;
+    SeparatorOutput separatorOut_;
     // Metering scratch. Members rather than function-local statics: a
     // thread_local static would allocate on first use, and first use is on the
     // audio thread.

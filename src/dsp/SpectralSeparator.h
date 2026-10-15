@@ -27,6 +27,17 @@
 
 namespace fbk
 {
+// What a separator reports for one analysis frame. Voice presence and feedback
+// probability are separate heads, not complements: a band can be neither (steady
+// room noise) and a sustained sung note can look feedback-like to a model without
+// being voice-free. Keeping them independent lets the DSP decide how each is used.
+struct SeparatorOutput
+{
+    float voicePresence[kNumBands] {};   // [0,1], per band
+    float feedbackProb[kNumBands] {};    // [0,1], per band
+    float voiceActivity { 0.0f };        // [0,1], broadband
+};
+
 class SpectralSeparator
 {
 public:
@@ -35,9 +46,19 @@ public:
     virtual void prepare (double sampleRate, const ErbBands& bands) = 0;
     virtual void reset() = 0;
 
+    // The user-facing controls a model may be conditioned on, each in [0,1]:
+    // {feedback sensitivity, feedback depth, max cut / 18 dB, voice protection}.
+    // Called from the frame boundary before process(). Default: ignored.
+    virtual void setControl (const float* /*control*/, int /*count*/) noexcept {}
+
     // Called once per analysis frame. bandEnergy is kNumBands linear power
-    // values; voicePresenceOut must be filled with kNumBands values in [0,1].
-    virtual void process (const float* bandEnergy, float* voicePresenceOut) = 0;
+    // values; every field of `out` must be filled, all values in [0,1].
+    //
+    // feedbackProb is advisory. It may make the detector believe a tone sooner, but
+    // it can never confirm one on its own and it cannot override the frequency-
+    // stability criterion (see HowlDetector::setLearnedPrior). A model that is
+    // confidently wrong therefore costs speed, not voice.
+    virtual void process (const float* bandEnergy, SeparatorOutput& out) = 0;
 
     virtual bool isReady() const = 0;
     virtual const char* name() const = 0;
@@ -50,11 +71,7 @@ class NullSeparator final : public SpectralSeparator
 public:
     void prepare (double, const ErbBands&) override {}
     void reset() override {}
-    void process (const float*, float* voicePresenceOut) override
-    {
-        for (int b = 0; b < kNumBands; ++b)
-            voicePresenceOut[b] = 0.0f;
-    }
+    void process (const float*, SeparatorOutput& out) override { out = SeparatorOutput {}; }
     bool isReady() const override { return false; }
     const char* name() const override { return "none (v0.1 DSP only)"; }
 };

@@ -14,11 +14,16 @@
 #include "FeedbackSuppressor.h"
 #include "Fft.h"
 #include "MaskFilter.h"
+#include "NeuralSeparator.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <utility>
+#include <string>
+#include <limits>
+#include <cstring>
 #include <memory>
 #include <new>
 
@@ -1067,6 +1072,668 @@ void testModePriorsSpeedUpEngagement()
     CHECK_LT (with, without);
 }
 
+
+// ===========================================================================
+// A stand-in for the v0.2 network: reports fixed values, so each test controls
+// exactly what the "model" claims and can check what the DSP does with it.
+class MockSeparator final : public SpectralSeparator
+{
+public:
+    MockSeparator (float voice, float feedback, bool ready = true)
+        : voice_ (voice), feedback_ (feedback), ready_ (ready) {}
+
+    void prepare (double, const ErbBands&) override {}
+    void reset() override {}
+    void process (const float*, SeparatorOutput& out) override
+    {
+        for (int b = 0; b < kNumBands; ++b)
+        {
+            out.voicePresence[b] = voice_;
+            out.feedbackProb[b] = feedback_;
+        }
+        out.voiceActivity = voice_;
+    }
+    bool isReady() const override { return ready_; }
+    const char* name() const override { return "mock"; }
+
+private:
+    float voice_, feedback_;
+    bool ready_;
+};
+
+// ===========================================================================
+void testLearnedFeedbackPriorSpeedsEngagement()
+{
+    beginTest ("Learned feedback prior makes engagement faster, like a mode prior");
+
+    const double sr = 48000.0;
+    const double toneHz = 1830.0;
+
+    // Same end-to-end measurement as the mode-prior test: tone energy leaking
+    // through in the first second after an abrupt onset. The baseline is a model
+    // that is attached and ready but says "no feedback", so the comparison isolates
+    // the prior from the presence replacement that comes with any attached model.
+    const auto leaked = [&] (float feedbackProb) -> double
+    {
+        FeedbackSuppressor fs;
+        fs.prepare (sr, 256);
+        auto params = defaultParams();
+        params.denoiseEnabled = false;
+        params.humEnabled = false;
+        params.highPassEnabled = false;
+        fs.setParameters (params);
+
+        MockSeparator sep (0.0f, feedbackProb);
+        fs.setSeparator (&sep);
+
+        const int n = static_cast<int> (sr * 1.5);
+        const int onset = static_cast<int> (sr * 0.25);
+        Rng rng (61);
+        std::vector<float> sig (static_cast<size_t> (n));
+        double phase = 0.0;
+        for (int i = 0; i < n; ++i)
+        {
+            phase += 2.0 * fbk::kPi * toneHz / sr;
+            const float tone = i >= onset ? static_cast<float> (0.3 * std::sin (phase)) : 0.0f;
+            sig[static_cast<size_t> (i)] = tone + 0.002f * rng.gaussian();
+        }
+
+        const auto out = run (fs, sig, 64);
+        double e = 0.0;
+        for (int i = onset; i < n; ++i)
+            e += static_cast<double> (out[static_cast<size_t> (i)]) * out[static_cast<size_t> (i)];
+        return e;
+    };
+
+    const double unsure = leaked (0.0f);
+    const double sure = leaked (1.0f);
+    info2 ("leaked tone energy: model says 0 -> %.4f, model says 1 -> %.4f", unsure, sure);
+    info ("reduction = %.1f%%", 100.0 * (unsure - sure) / std::max (unsure, 1e-12));
+    CHECK_LT (sure, unsure);
+}
+
+// ===========================================================================
+void testWrongModelCannotMakeSungNoteFeedback()
+{
+    beginTest ("A confidently wrong model cannot turn a sung note into feedback");
+
+    // The safety property of the prior: it relaxes ratio and persistence evidence
+    // only, and never touches the frequency-stability criterion. So a model that
+    // insists every band is feedback, with zero voice presence, still cannot make
+    // the detector confirm a moving voice.
+    const double sr = 48000.0;
+    FeedbackSuppressor fs;
+    fs.prepare (sr, 256);
+    auto p = defaultParams();
+    p.denoiseEnabled = false;
+    p.humEnabled = false;
+    p.highPassEnabled = false;
+    fs.setParameters (p);
+
+    MockSeparator sep (0.0f, 1.0f);
+    fs.setSeparator (&sep);
+
+    const int n = static_cast<int> (sr * 6.0);
+    SyntheticVoice voice (sr, 220.0);
+    std::vector<float> sig (static_cast<size_t> (n));
+    for (int i = 0; i < n; ++i)
+        sig[static_cast<size_t> (i)] = 2.5f * voice.next();
+
+    // Process in 0.25 s slices and take the worst confirmed count seen at any
+    // point, not just the end - a false positive that came and went still matters.
+    std::vector<float> out = sig;
+    int worstConfirmed = 0;
+    const int slice = static_cast<int> (sr * 0.25);
+    for (int pos = 0; pos < n; pos += slice)
+    {
+        const int len = std::min (slice, n - pos);
+        for (int o = 0; o < len; o += 128)
+            fs.processBlock (out.data() + pos + o, std::min (128, len - o));
+        worstConfirmed = std::max (worstConfirmed, fs.metering().confirmedTones);
+    }
+
+    const int mStart = n - static_cast<int> (sr * 2.0);
+    const int mLen = static_cast<int> (sr * 2.0);
+    const double db = toDb (rms (out.data() + mStart, mLen)) - toDb (rms (sig.data() + mStart, mLen));
+    info ("held-note level change = %+.2f dB", db);
+    info ("worst confirmed-tone count over the run = %.0f", static_cast<double> (worstConfirmed));
+
+    CHECK_LT (std::abs (db), 1.5);
+    CHECK (worstConfirmed == 0);
+}
+
+// ===========================================================================
+void testSeparatorPresenceReachesTheMask()
+{
+    beginTest ("Separator voice presence reaches the mask and is detachable");
+
+    const double sr = 48000.0;
+    const int n = static_cast<int> (sr * 4.0);
+
+    Rng rng (23);
+    std::vector<float> noise (static_cast<size_t> (n));
+    for (auto& v : noise)
+        v = 0.05f * rng.gaussian();
+
+    const auto outputRms = [&] (SpectralSeparator* sep) -> double
+    {
+        FeedbackSuppressor fs;
+        fs.prepare (sr, 256);
+        auto p = defaultParams();
+        p.feedbackEnabled = false;
+        p.humEnabled = false;
+        p.highPassEnabled = false;
+        p.denoiseAmount = 1.0f;
+        p.voiceProtection = 1.0f;
+        fs.setParameters (p);
+        fs.setSeparator (sep);
+        const auto out = run (fs, noise, 128);
+        return rms (out.data() + n / 2, n / 2);
+    };
+
+    MockSeparator saysNoVoice (0.0f, 0.0f), saysVoice (1.0f, 0.0f), notReady (1.0f, 1.0f, false);
+
+    const double none = outputRms (nullptr);
+    const double noVoice = outputRms (&saysNoVoice);
+    const double voice = outputRms (&saysVoice);
+    const double idle = outputRms (&notReady);
+
+    info2 ("steady noise out: no model %.5f, model says no voice %.5f", none, noVoice);
+    info2 ("                  model says voice %.5f, model not ready %.5f", voice, idle);
+
+    // Where the model says "voice", the mask backs off and more passes through.
+    CHECK_GT (voice, noVoice * 1.05);
+    // A model that is attached but not ready must change nothing at all.
+    CHECK_CLOSE (idle, none, 1.0e-12);
+}
+
+
+// ===========================================================================
+// Neural separator tests. There are no trained weights in the repository, so the
+// tests build models with deterministic random weights. That is enough to pin
+// down everything that is a property of the engine rather than of training: the
+// file format, the arithmetic, robustness, real-time safety, and - the one that
+// matters most - that no model at all, however it was trained, can make the
+// detector mistake a held note for feedback.
+struct TestModel
+{
+    std::vector<unsigned char> bytes;
+    std::vector<std::pair<std::string, std::vector<float>>> tensors;
+    std::vector<std::pair<std::string, std::vector<uint32_t>>> shapes;
+
+    const std::vector<float>& get (const char* n) const
+    {
+        for (const auto& t : tensors)
+            if (t.first == n)
+                return t.second;
+        std::abort();
+    }
+};
+
+void appendU32 (std::vector<unsigned char>& b, uint32_t v)
+{
+    for (int i = 0; i < 4; ++i)
+        b.push_back (static_cast<unsigned char> ((v >> (8 * i)) & 0xFF));
+}
+
+TestModel makeModel (int H, int T, int S, uint32_t seed, float scale)
+{
+    TestModel m;
+    Rng rng (seed);
+    const auto add = [&] (const char* name, std::vector<uint32_t> dims, int fanIn)
+    {
+        size_t n = 1;
+        for (auto d : dims)
+            n *= d;
+        std::vector<float> v (n);
+        for (auto& x : v)
+            x = scale * rng.uniform() / std::sqrt (static_cast<float> (fanIn));
+        m.tensors.emplace_back (name, std::move (v));
+        m.shapes.emplace_back (name, std::move (dims));
+    };
+
+    const uint32_t h = static_cast<uint32_t> (H), t = static_cast<uint32_t> (T);
+    const int O = NeuralSeparator::kNumOutputs, F = NeuralSeparator::kNumFeatures;
+    add ("in.weight", { h, static_cast<uint32_t> (F) }, F);
+    add ("in.bias", { h }, F);
+    add ("film.trunk.weight", { t, 4 }, 4);
+    add ("film.trunk.bias", { t }, 4);
+    add ("film.gamma.weight", { h, t }, T);
+    add ("film.gamma.bias", { h }, T);
+    add ("film.beta.weight", { h, t }, T);
+    add ("film.beta.bias", { h }, T);
+    add ("core.weight_ih", { 3 * h, h }, H);
+    add ("core.weight_hh", { 3 * h, h }, H);
+    add ("core.bias_ih", { 3 * h }, H);
+    add ("core.bias_hh", { 3 * h }, H);
+    add ("head.weight", { static_cast<uint32_t> (O), h }, H);
+    add ("head.bias", { static_cast<uint32_t> (O) }, H);
+    if (S > 0)
+    {
+        const uint32_t sh = static_cast<uint32_t> (S);
+        add ("smoother.weight_ih", { 3 * sh, static_cast<uint32_t> (O) }, O);
+        add ("smoother.weight_hh", { 3 * sh, sh }, S);
+        add ("smoother.bias_ih", { 3 * sh }, S);
+        add ("smoother.bias_hh", { 3 * sh }, S);
+        add ("smoother.out.weight", { static_cast<uint32_t> (O), sh }, S);
+        add ("smoother.out.bias", { static_cast<uint32_t> (O) }, S);
+    }
+
+    appendU32 (m.bytes, 0x4D4B4246u);
+    appendU32 (m.bytes, 1u);
+    appendU32 (m.bytes, static_cast<uint32_t> (m.tensors.size()));
+    for (size_t i = 0; i < m.tensors.size(); ++i)
+    {
+        const auto& name = m.tensors[i].first;
+        appendU32 (m.bytes, static_cast<uint32_t> (name.size()));
+        m.bytes.insert (m.bytes.end(), name.begin(), name.end());
+        appendU32 (m.bytes, static_cast<uint32_t> (m.shapes[i].second.size()));
+        for (auto d : m.shapes[i].second)
+            appendU32 (m.bytes, d);
+        const auto* raw = reinterpret_cast<const unsigned char*> (m.tensors[i].second.data());
+        m.bytes.insert (m.bytes.end(), raw, raw + m.tensors[i].second.size() * sizeof (float));
+    }
+    return m;
+}
+
+// An independent implementation of the documented network, in double precision and
+// written from the description in NeuralSeparator.h rather than from the engine.
+struct ReferenceNet
+{
+    const TestModel& m;
+    int H, T, S;
+    std::vector<double> hc, hs;
+    double prev[kNumBands] {};
+    bool hasPrev { false };
+
+    ReferenceNet (const TestModel& model, int h, int t, int s)
+        : m (model), H (h), T (t), S (s), hc (static_cast<size_t> (h), 0.0),
+          hs (static_cast<size_t> (std::max (s, 1)), 0.0) {}
+
+    static double sig (double x) { return 1.0 / (1.0 + std::exp (-x)); }
+
+    std::vector<double> dense (const char* w, const char* b, const std::vector<double>& x, int out) const
+    {
+        const auto& W = m.get (w);
+        const auto& B = m.get (b);
+        std::vector<double> y (static_cast<size_t> (out));
+        for (int o = 0; o < out; ++o)
+        {
+            double a = B[static_cast<size_t> (o)];
+            for (size_t i = 0; i < x.size(); ++i)
+                a += static_cast<double> (W[static_cast<size_t> (o) * x.size() + i]) * x[i];
+            y[static_cast<size_t> (o)] = a;
+        }
+        return y;
+    }
+
+    void gru (const std::string& p, const std::vector<double>& x, std::vector<double>& h, int n) const
+    {
+        const auto& Wi = m.get ((p + ".weight_ih").c_str());
+        const auto& Wh = m.get ((p + ".weight_hh").c_str());
+        const auto& Bi = m.get ((p + ".bias_ih").c_str());
+        const auto& Bh = m.get ((p + ".bias_hh").c_str());
+        const auto row = [&] (int r, const std::vector<float>& W, const std::vector<double>& v,
+                              const std::vector<float>& B)
+        {
+            double a = B[static_cast<size_t> (r)];
+            for (size_t i = 0; i < v.size(); ++i)
+                a += static_cast<double> (W[static_cast<size_t> (r) * v.size() + i]) * v[i];
+            return a;
+        };
+        std::vector<double> next (static_cast<size_t> (n));
+        for (int i = 0; i < n; ++i)
+        {
+            const double r = sig (row (i, Wi, x, Bi) + row (i, Wh, h, Bh));
+            const double z = sig (row (n + i, Wi, x, Bi) + row (n + i, Wh, h, Bh));
+            const double c = std::tanh (row (2 * n + i, Wi, x, Bi) + r * row (2 * n + i, Wh, h, Bh));
+            next[static_cast<size_t> (i)] = (1.0 - z) * c + z * h[static_cast<size_t> (i)];
+        }
+        h = next;
+    }
+
+    // Returns the 65 output probabilities.
+    std::vector<double> step (const float* energy, const float* control)
+    {
+        double db[kNumBands];
+        double mx = -120.0;
+        for (int b = 0; b < kNumBands; ++b)
+        {
+            db[b] = 10.0 * std::log10 (static_cast<double> (energy[b]) + 1e-12);
+            mx = std::max (mx, db[b]);
+        }
+        std::vector<double> f (64);
+        for (int b = 0; b < kNumBands; ++b)
+        {
+            f[static_cast<size_t> (b)] = std::clamp ((db[b] - mx) / 60.0, -1.0, 0.0);
+            f[static_cast<size_t> (kNumBands + b)] =
+                hasPrev ? std::clamp ((db[b] - prev[b]) / 20.0, -1.0, 1.0) : 0.0;
+            prev[b] = db[b];
+        }
+        hasPrev = true;
+
+        std::vector<double> c (control, control + 4);
+        auto tr = dense ("film.trunk.weight", "film.trunk.bias", c, T);
+        for (auto& v : tr)
+            v = std::tanh (v);
+        const auto g = dense ("film.gamma.weight", "film.gamma.bias", tr, H);
+        const auto be = dense ("film.beta.weight", "film.beta.bias", tr, H);
+
+        auto x = dense ("in.weight", "in.bias", f, H);
+        for (size_t i = 0; i < x.size(); ++i)
+            x[i] = (1.0 + g[i]) * std::tanh (x[i]) + be[i];
+
+        gru ("core", x, hc, H);
+        auto l = dense ("head.weight", "head.bias", hc, 65);
+        if (S > 0)
+        {
+            std::vector<double> p (65);
+            for (size_t i = 0; i < 65; ++i)
+                p[i] = sig (l[i]);
+            gru ("smoother", p, hs, S);
+            const auto d = dense ("smoother.out.weight", "smoother.out.bias", hs, 65);
+            for (size_t i = 0; i < 65; ++i)
+                l[i] += d[i];
+        }
+        for (auto& v : l)
+            v = sig (v);
+        return l;
+    }
+};
+
+void testNeuralSeparatorLoadValidation()
+{
+    beginTest ("Neural separator: model file validation");
+
+    const auto good = makeModel (24, 8, 12, 5, 1.0f);
+    NeuralSeparator sep;
+    CHECK (! sep.isReady());
+
+    auto r = sep.load (good.bytes.data(), good.bytes.size());
+    info ("parameters in test model = %.0f", static_cast<double> (sep.parameterCount()));
+    CHECK (r.ok);
+    CHECK (sep.isReady());
+    CHECK (sep.hiddenSize() == 24 && sep.smootherSize() == 12);
+
+    // A model without the optional smoother is valid.
+    const auto noSmoother = makeModel (16, 4, 0, 6, 1.0f);
+    r = sep.load (noSmoother.bytes.data(), noSmoother.bytes.size());
+    CHECK (r.ok && sep.smootherSize() == 0);
+
+    // Every way a file can be wrong must be refused, leave the separator unloaded,
+    // and never read out of bounds. Truncating at every length covers the lot.
+    int accepted = 0;
+    for (size_t len = 0; len < good.bytes.size(); len += 7)
+    {
+        sep.load (good.bytes.data(), len);
+        if (sep.isReady())
+            ++accepted;
+    }
+    info ("truncated prefixes accepted = %.0f", static_cast<double> (accepted));
+    CHECK (accepted == 0);
+
+    auto bad = good.bytes;
+    bad[0] ^= 0xFF;
+    CHECK (! sep.load (bad.data(), bad.size()).ok && ! sep.isReady());
+
+    bad = good.bytes;
+    bad[4] = 9;   // version
+    CHECK (! sep.load (bad.data(), bad.size()).ok);
+
+    // A NaN weight anywhere is refused.
+    bad = good.bytes;
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    std::memcpy (bad.data() + bad.size() - 4, &nan, 4);
+    CHECK (! sep.load (bad.data(), bad.size()).ok);
+
+    // Wrong shape: swap the head to the wrong output count.
+    {
+        TestModel wrong = makeModel (16, 4, 0, 7, 1.0f);
+        for (size_t i = 0; i < wrong.shapes.size(); ++i)
+            if (wrong.shapes[i].first == "head.bias")
+                wrong.shapes[i].second[0] = 64;
+        // Rebuild the byte stream from the altered shapes (data length now mismatches
+        // the dims, which the reader must also catch as truncation or misparse).
+        std::vector<unsigned char> b;
+        appendU32 (b, 0x4D4B4246u); appendU32 (b, 1u);
+        appendU32 (b, static_cast<uint32_t> (wrong.tensors.size()));
+        for (size_t i = 0; i < wrong.tensors.size(); ++i)
+        {
+            const auto& nm = wrong.tensors[i].first;
+            appendU32 (b, static_cast<uint32_t> (nm.size()));
+            b.insert (b.end(), nm.begin(), nm.end());
+            appendU32 (b, static_cast<uint32_t> (wrong.shapes[i].second.size()));
+            for (auto d : wrong.shapes[i].second)
+                appendU32 (b, d);
+            const auto* raw = reinterpret_cast<const unsigned char*> (wrong.tensors[i].second.data());
+            const size_t bytesToWrite = static_cast<size_t> ([&] { size_t n = 1; for (auto d : wrong.shapes[i].second) n *= d; return n; }()) * 4;
+            b.insert (b.end(), raw, raw + std::min (bytesToWrite, wrong.tensors[i].second.size() * 4));
+        }
+        CHECK (! sep.load (b.data(), b.size()).ok);
+    }
+    CHECK (! sep.isReady());
+}
+
+void testNeuralSeparatorMatchesReference()
+{
+    beginTest ("Neural separator: matches an independent double-precision reference");
+
+    for (const int smoother : { 0, 12 })
+    {
+        const auto model = makeModel (24, 8, smoother, 11u + static_cast<uint32_t> (smoother), 1.5f);
+        NeuralSeparator sep;
+        CHECK (sep.load (model.bytes.data(), model.bytes.size()).ok);
+        ErbBands bands;
+        bands.prepare (48000.0);
+        sep.prepare (48000.0, bands);
+
+        ReferenceNet ref (model, 24, 8, smoother);
+        Rng rng (99);
+        double worst = 0.0;
+        float control[4] = { 0.5f, 1.0f, 0.5f, 0.8f };
+        for (int frame = 0; frame < 300; ++frame)
+        {
+            float energy[kNumBands];
+            for (int b = 0; b < kNumBands; ++b)
+                energy[b] = std::pow (10.0f, 2.0f * rng.uniform() - 4.0f * static_cast<float> (b) / kNumBands);
+
+            // Change the controls part-way, so FiLM re-evaluation is exercised.
+            if (frame % 50 == 25)
+                for (auto& c : control)
+                    c = 0.5f + 0.5f * rng.uniform();
+            sep.setControl (control, 4);
+
+            SeparatorOutput out;
+            sep.process (energy, out);
+            const auto want = ref.step (energy, control);
+
+            for (int b = 0; b < kNumBands; ++b)
+            {
+                worst = std::max (worst, std::abs (static_cast<double> (out.voicePresence[b]) - want[static_cast<size_t> (b)]));
+                worst = std::max (worst, std::abs (static_cast<double> (out.feedbackProb[b]) - want[static_cast<size_t> (kNumBands + b)]));
+            }
+            worst = std::max (worst, std::abs (static_cast<double> (out.voiceActivity) - want[64]));
+        }
+        info2 ("smoother size %.0f: worst deviation from reference over 300 frames = %.3g",
+               static_cast<double> (smoother), worst);
+        CHECK_LT (worst, 1.0e-4);
+    }
+}
+
+void testNeuralSeparatorRobustness()
+{
+    beginTest ("Neural separator: hostile input cannot poison the output");
+
+    const auto model = makeModel (24, 8, 12, 17, 3.0f);
+    NeuralSeparator sep;
+    CHECK (sep.load (model.bytes.data(), model.bytes.size()).ok);
+
+    const float inf = std::numeric_limits<float>::infinity();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float hostile[] = { nan, inf, -inf, 1.0e30f, -5.0f, 0.0f, 1.0e-45f };
+
+    bool allFinite = true, inRange = true;
+    SeparatorOutput out;
+    for (int frame = 0; frame < 200; ++frame)
+    {
+        float energy[kNumBands];
+        for (int b = 0; b < kNumBands; ++b)
+            energy[b] = hostile[(b + frame) % 7];
+        sep.process (energy, out);
+        for (int b = 0; b < kNumBands; ++b)
+        {
+            const float v = out.voicePresence[b], f = out.feedbackProb[b];
+            allFinite = allFinite && std::isfinite (v) && std::isfinite (f);
+            inRange = inRange && v >= 0.0f && v <= 1.0f && f >= 0.0f && f <= 1.0f;
+        }
+    }
+    CHECK (allFinite);
+    CHECK (inRange);
+
+    // And it recovers: normal input afterwards produces the same answer a fresh
+    // instance gives, once the recurrent state has settled.
+    NeuralSeparator fresh;
+    CHECK (fresh.load (model.bytes.data(), model.bytes.size()).ok);
+    sep.reset();
+    Rng rng (3);
+    SeparatorOutput a, b;
+    for (int frame = 0; frame < 20; ++frame)
+    {
+        float energy[kNumBands];
+        for (auto& e : energy)
+            e = std::pow (10.0f, 3.0f * rng.uniform() - 2.0f);
+        sep.process (energy, a);
+        fresh.process (energy, b);
+    }
+    double dev = 0.0;
+    for (int i = 0; i < kNumBands; ++i)
+        dev = std::max (dev, static_cast<double> (std::abs (a.voicePresence[i] - b.voicePresence[i])));
+    info ("deviation from a fresh instance after reset = %.3g", dev);
+    CHECK_LT (dev, 1.0e-6);
+}
+
+void testArbitraryModelCannotMakeSungNoteFeedback()
+{
+    beginTest ("No model, however it was trained, can turn a sung note into feedback");
+
+    // Several arbitrary models with large weights, so their outputs swing hard and
+    // often saturate. Whatever they claim, the held note must be untouched: the
+    // prior never relaxes the frequency-stability criterion.
+    const double sr = 48000.0;
+    for (uint32_t seed = 1; seed <= 4; ++seed)
+    {
+        const auto model = makeModel (32, 8, 16, 100u + seed, 4.0f);
+        NeuralSeparator sep;
+        CHECK (sep.load (model.bytes.data(), model.bytes.size()).ok);
+
+        FeedbackSuppressor fs;
+        fs.prepare (sr, 256);
+        auto p = defaultParams();
+        p.denoiseEnabled = false;
+        p.humEnabled = false;
+        p.highPassEnabled = false;
+        fs.setParameters (p);
+        fs.setSeparator (&sep);
+
+        const int n = static_cast<int> (sr * 5.0);
+        SyntheticVoice voice (sr, 220.0);
+        std::vector<float> sig (static_cast<size_t> (n));
+        for (int i = 0; i < n; ++i)
+            sig[static_cast<size_t> (i)] = 2.5f * voice.next();
+
+        std::vector<float> out = sig;
+        int worstConfirmed = 0;
+        for (int pos = 0; pos < n; pos += 128)
+        {
+            fs.processBlock (out.data() + pos, std::min (128, n - pos));
+            worstConfirmed = std::max (worstConfirmed, fs.metering().confirmedTones);
+        }
+
+        const int mStart = n - static_cast<int> (sr * 2.0);
+        const int mLen = static_cast<int> (sr * 2.0);
+        const double db = toDb (rms (out.data() + mStart, mLen)) - toDb (rms (sig.data() + mStart, mLen));
+        info2 ("seed %.0f: held-note change %+.2f dB", static_cast<double> (seed), db);
+        CHECK (worstConfirmed == 0);
+        CHECK_LT (std::abs (db), 1.5);
+    }
+}
+
+void testNeuralSeparatorBlockSizeInvariance()
+{
+    beginTest ("Neural separator: output independent of host block size");
+
+    const double sr = 48000.0;
+    const auto model = makeModel (24, 8, 12, 41, 2.0f);
+
+    const auto render = [&] (int blockSize)
+    {
+        NeuralSeparator sep;
+        sep.load (model.bytes.data(), model.bytes.size());
+        FeedbackSuppressor fs;
+        fs.prepare (sr, blockSize);
+        auto p = defaultParams();
+        p.dereverbEnabled = true;
+        fs.setParameters (p);
+        fs.setSeparator (&sep);
+
+        SyntheticVoice voice (sr, 150.0);
+        Rng rng (8);
+        std::vector<float> sig (static_cast<size_t> (sr * 2.0));
+        for (auto& v : sig)
+            v = voice.next() + 0.01f * rng.gaussian();
+        return run (fs, sig, blockSize);
+    };
+
+    const auto a = render (16);
+    const auto b = render (512);
+    double worst = 0.0;
+    for (size_t i = 0; i < a.size(); ++i)
+        worst = std::max (worst, static_cast<double> (std::abs (a[i] - b[i])));
+    info ("max deviation 16 vs 512 with a model attached = %.3g", worst);
+    CHECK_LT (worst, 1.0e-9);
+}
+
+void testNeuralSeparatorNoAllocation()
+{
+    beginTest ("Neural separator: no allocation in the audio path");
+
+    const double sr = 48000.0;
+    const auto model = makeModel (48, 12, 24, 77, 1.5f);
+    NeuralSeparator sep;
+    CHECK (sep.load (model.bytes.data(), model.bytes.size()).ok);
+
+    FeedbackSuppressor fs;
+    fs.prepare (sr, 128);
+    auto p = defaultParams();
+    fs.setParameters (p);
+    fs.setSeparator (&sep);
+
+    SyntheticVoice voice (sr, 145.0);
+    Rng rng (13);
+    std::vector<float> block (128);
+    for (int i = 0; i < 200; ++i)
+    {
+        for (auto& v : block)
+            v = voice.next() + 0.002f * rng.gaussian();
+        fs.processBlock (block.data(), 128);
+    }
+
+    rtcheck::arm();
+    for (int i = 0; i < 2000; ++i)
+    {
+        for (auto& v : block)
+            v = voice.next() + 0.002f * rng.gaussian();
+        // Controls change constantly, which re-evaluates the FiLM branch.
+        p.feedbackSensitivity = 0.2f + 0.6f * static_cast<float> (i % 50) / 50.0f;
+        p.maxAttenuationDb = 6.0f + static_cast<float> (i % 12);
+        fs.setParameters (p);
+        fs.processBlock (block.data(), 128);
+    }
+    const int allocations = rtcheck::disarm();
+    info ("allocations during 2000 blocks with a model attached = %.0f", static_cast<double> (allocations));
+    CHECK (allocations == 0);
+}
+
 // ===========================================================================
 void testTelemetryRing()
 {
@@ -1587,6 +2254,15 @@ int main()
     testObserveOnlyDoesNotProcess();
     testProfileKeepsVoiceSafeAndTonesCaught();
     testModePriorsSpeedUpEngagement();
+    testLearnedFeedbackPriorSpeedsEngagement();
+    testWrongModelCannotMakeSungNoteFeedback();
+    testSeparatorPresenceReachesTheMask();
+    testNeuralSeparatorLoadValidation();
+    testNeuralSeparatorMatchesReference();
+    testNeuralSeparatorRobustness();
+    testArbitraryModelCannotMakeSungNoteFeedback();
+    testNeuralSeparatorBlockSizeInvariance();
+    testNeuralSeparatorNoAllocation();
     testTelemetryRing();
     testTelemetryCapturesDetection();
     testEventTriggerFiresAndHoldsOff();

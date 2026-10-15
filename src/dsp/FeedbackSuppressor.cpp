@@ -29,7 +29,7 @@ void FeedbackSuppressor::prepare (double sampleRate, int maxBlockSize)
     powerCoeff_ = static_cast<float> (std::exp (-1.0 / (0.100 * sampleRate_)));
 
     bandEnergy_.assign (kNumBands, 0.0f);
-    separatorPresence_.assign (kNumBands, 0.0f);
+    separatorOut_ = SeparatorOutput {};
     meterBandNoise_.assign (kNumBands, 0.0f);
     meterBandPower_.assign (kNumBands, 0.0f);
     bandProtection_.assign (kNumBands, 0.8f);
@@ -195,12 +195,24 @@ void FeedbackSuppressor::onAnalysisFrame() noexcept
     }
 
     // v0.2: if a learned separator is attached, hand it the band energies. Its
-    // per-band voice presence is intended to replace the heuristic estimate. The
-    // call is made here, on the frame boundary, and never touches the audio path.
+    // voice presence replaces the heuristic estimate in the mask, and its feedback
+    // probability becomes an advisory prior for the detector. The call is made
+    // here, on the frame boundary, and never touches the audio path. Detaching the
+    // model (or it reporting not-ready) restores the pure-DSP behaviour exactly.
     if (separator_ != nullptr && separator_->isReady())
     {
         bands_.binsToBands (power, bandEnergy_.data());
-        separator_->process (bandEnergy_.data(), separatorPresence_.data());
+        const float control[4] = { params_.feedbackSensitivity, params_.feedbackDepth,
+                                   params_.maxAttenuationDb / 18.0f, params_.voiceProtection };
+        separator_->setControl (control, 4);
+        separator_->process (bandEnergy_.data(), separatorOut_);
+        noise_.setExternalPresence (separatorOut_.voicePresence, separatorOut_.voiceActivity);
+        detector_.setLearnedPrior (separatorOut_.feedbackProb);
+    }
+    else
+    {
+        noise_.setExternalPresence (nullptr, 0.0f);
+        detector_.setLearnedPrior (nullptr);
     }
 
     if (params_.feedbackEnabled)

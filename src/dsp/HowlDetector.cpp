@@ -93,6 +93,13 @@ void HowlDetector::setModePriors (const float* freqsHz, int count) noexcept
         priors_[i] = freqsHz[i];
 }
 
+void HowlDetector::setLearnedPrior (const float* p) noexcept
+{
+    learnedActive_ = (p != nullptr);
+    for (int b = 0; b < kNumBands; ++b)
+        learnedPrior_[b] = p != nullptr ? clampf (p[b], 0.0f, 1.0f) : 0.0f;
+}
+
 bool HowlDetector::isNearPrior (float freqHz) const noexcept
 {
     for (int i = 0; i < numPriors_; ++i)
@@ -421,10 +428,20 @@ void HowlDetector::process (const float* magnitude) noexcept
         // the profiling phase buys - faster engagement where we already know the
         // room rings, with no pre-emptive attenuation anywhere.
         const bool onPrior = isNearPrior (t.freqHz);
-        const float priorRelaxDb = onPrior ? 3.0f : 0.0f;
-        const int   priorIpmp = onPrior
+
+        // A learned model's confidence works the same way, scaled continuously:
+        // nothing below p = 0.5, full effect at p = 1. The effect is capped at the
+        // mode-prior's, and the two take the stronger of the pair rather than
+        // adding, so the worst case is no more lenient than a profiled room mode.
+        float learned = 0.0f;
+        if (learnedActive_ && bands_ != nullptr)
+            learned = clampf ((learnedPrior_[bands_->bandForBin (t.bin)] - 0.5f) * 2.0f, 0.0f, 1.0f);
+        const float relax = std::max (onPrior ? 1.0f : 0.0f, learned);
+
+        const float priorRelaxDb = 3.0f * relax;
+        const int   priorIpmp = relax > 0.0f
                               ? std::max (3, static_cast<int> (std::lround (
-                                    static_cast<float> (thr_.ipmpFrames) * 0.4f)))
+                                    static_cast<float> (thr_.ipmpFrames) * (1.0f - 0.6f * relax))))
                               : thr_.ipmpFrames;
 
         const bool papr = t.paprDb > thr_.paprDb - priorRelaxDb;
