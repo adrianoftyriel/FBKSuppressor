@@ -148,6 +148,18 @@ bool MaskFilter::updateMask (const float* power, const NoiseTracker& noise) noex
 
             // Wiener gain.
             float g = priorSnr_[i] / (1.0f + priorSnr_[i]);
+
+            // Fast attack. The smoother above is deliberately slow, which is right
+            // for noise but means that after a long pause the gain is still closed
+            // when a voice starts, and the first frames come out attenuated with a
+            // hard edge. Where the posterior SNR is clearly speech (6 dB rising to
+            // 12 dB) let the gain open straight to the instantaneous Wiener value.
+            // Release is untouched, and noise-only bands never reach this ramp.
+            const float snrDb = 10.0f * std::log10 (std::max (snrPost, 1.0e-12f));
+            const float attack = clampf ((snrDb - 6.0f) / 6.0f, 0.0f, 1.0f);
+            const float gInst = instantaneous / (1.0f + instantaneous);
+            g += attack * std::max (gInst - g, 0.0f);
+
             prevGain_[i] = g;
 
             // Scale the *attenuation* by the amount control, so amount=0 is

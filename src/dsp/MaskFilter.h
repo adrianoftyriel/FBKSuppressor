@@ -21,7 +21,7 @@
 // First, the mask is built on 32 ERB bands and interpolated smoothly between band
 // centres, so its magnitude response has no sharp edges and the corresponding
 // minimum-phase impulse response decays inside 64 taps. Second, the mask is
-// redesigned only every kMaskDecimation hops and the coefficients are
+// redesigned every kMaskDecimation hops and the coefficients are
 // interpolated between designs, so there is no zipper noise and the design cost
 // is amortised.
 //

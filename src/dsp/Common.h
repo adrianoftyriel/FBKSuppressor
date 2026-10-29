@@ -22,14 +22,14 @@ namespace fbk
 // per rate, so nothing else in the chain cares which rate we are running at.
 //
 // The hop is 128 samples (~2.7 ms). Feedback grows exponentially, so the tone
-// tracker has to run fast; the broadband mask changes far more slowly and is
-// redesigned every kMaskDecimation hops instead.
+// tracker has to run fast. The mask is redesigned every kMaskDecimation hops; at
+// 1 it follows a voice onset within one hop instead of lagging by ~10 ms.
 // ---------------------------------------------------------------------------
 constexpr int kFftOrder       = 11;              // 2048
 constexpr int kFftSize        = 1 << kFftOrder;
 constexpr int kNumBins        = kFftSize / 2 + 1;
 constexpr int kHopSize        = 128;
-constexpr int kMaskDecimation = 4;               // mask redesign cadence, in hops
+constexpr int kMaskDecimation = 1;              // mask redesign cadence, in hops
 
 // Minimum-phase mask filter geometry. 256-point design FFT, 64 usable taps.
 constexpr int kDesignOrder = 8;                  // 256
